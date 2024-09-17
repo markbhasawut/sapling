@@ -1,0 +1,5 @@
+[manifest]
+name = gnu-sed
+
+[homebrew]
+gnu-sed

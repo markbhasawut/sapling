@@ -1,0 +1,5 @@
+[manifest]
+name = gnu-coreutils
+
+[homebrew]
+coreutils
