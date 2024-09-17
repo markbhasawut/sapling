@@ -8,6 +8,9 @@ nmap-ncat
 [debs]
 nmap
 
+[homebrew]
+nmap
+
 # 18.04 combines ncat into the nmap package, newer need the separate one
 [debs.not(all(distro=ubuntu,distro_vers="18.04"))]
 ncat
