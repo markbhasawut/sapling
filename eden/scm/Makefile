@@ -122,6 +122,11 @@ ifneq ($(OS),Windows_NT)
 endif
 	cp build/scripts-3.$(PYTHON_MINOR_VERSION)/$(HG_BIN_NAME) $(HG_BIN_NAME)
 
+install-hg: hg
+	PYTHON_SYS_EXECUTABLE=$(shell $(PYTHON3) contrib/pick_python.py $(PYTHON3)) \
+	  $(shell $(PYTHON3) contrib/pick_python.py $(PYTHON3)) \
+		setup.py $(PURE) install --root="$(DESTDIR)/" --prefix="$(PREFIX)" --install-lib="$(PREFIX)/bin" --force
+
 build:
 	$(PYTHON) setup.py $(PURE) build $(COMPILERFLAG)
 
