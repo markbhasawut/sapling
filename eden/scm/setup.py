@@ -1190,7 +1190,7 @@ hgmainfeatures = (
                 "buildinfo" if needbuildinfo else None,
                 "with_chg" if not iswindows else None,
                 "fb" if havefb else None,
-                "eden" if not ossbuild else None,
+                "eden" if ossbuild else None,
                 "sl_oss" if ossbuild else None,
             ],
         )
