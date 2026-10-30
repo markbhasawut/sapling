@@ -492,7 +492,9 @@ def versionagedays() -> int:
     try:
         v = version()
         parts = remod.split("_", v)
-        approxbuilddate = datetime.datetime.strptime(parts[1], "%Y%m%d")
+        # <base>_<date>_<time>_<hash>, or build.py's default <date>_<time>_<hash>.
+        date = parts[0] if remod.fullmatch(r"\d{8}", parts[0]) else parts[1]
+        approxbuilddate = datetime.datetime.strptime(date, "%Y%m%d")
         now = datetime.datetime.now()
         return (now - approxbuilddate).days
     except Exception:
