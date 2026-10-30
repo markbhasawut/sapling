@@ -6,6 +6,23 @@
 if (IS_FB_BUILD)
   set(features FEATURES fb)
 endif()
+# A static library doesn't carry the native libraries its crates link, so
+# whatever links it names them: on macOS, the frameworks and libraries that
+# `cargo rustc -- --print native-static-libs` lists, apart from the ones the
+# compiler links anyway and libcurl, which is below.
+set(native_libs)
+if (APPLE)
+  set(
+    native_libs
+    "-framework CoreFoundation"
+    "-framework Foundation"
+    "-framework IOKit"
+    "-framework OpenDirectory"
+    "-framework SystemConfiguration"
+    objc
+    iconv
+  )
+endif()
 rust_static_library(
   rust_edenfs_staticlib
   CRATE edenfs_staticlib
@@ -20,7 +37,7 @@ rust_static_library(
   # The curl crate needs libcurl from the final link, except on Windows, where
   # it builds its own copy.
   LINK_LIBRARIES backingstore_iobuf BLAKE3::blake3
-    $<TARGET_NAME_IF_EXISTS:CURL::libcurl>)
+    $<TARGET_NAME_IF_EXISTS:CURL::libcurl> ${native_libs})
 
 install_rust_static_library(
   rust_edenfs_staticlib

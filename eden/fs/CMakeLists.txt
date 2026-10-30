@@ -32,12 +32,6 @@ if(APPLE)
       LINK_LIBRARY_OVERRIDE_manifold_ffi WHOLE_ARCHIVE
       LINK_LIBRARY_OVERRIDE_redirect_ffi WHOLE_ARCHIVE
   )
-  target_link_libraries(
-    edenfs
-      "-framework IOKit"
-      "-framework OpenDirectory"
-      "-framework SystemConfiguration"
-  )
 endif()
 
 if(NOT WIN32)
