@@ -1521,7 +1521,15 @@ class EdenCheckout:
     def hg_dot_path(self) -> Path:
         from . import hg_util
 
-        return self.path / hg_util.sniff_dot_dir(self.path)
+        # A new checkout's dot dir is the backing repo's flavor, which the sl
+        # that runs in it recognizes: an open-source sl knows only ".sl".
+        try:
+            backing_repo = self.get_config().backing_repo
+        except CheckoutConfigCorruptedError:
+            default = None
+        else:
+            default = hg_util.sniff_dot_dir(backing_repo)
+        return self.path / hg_util.sniff_dot_dir(self.path, default)
 
     def _config_path(self) -> Path:
         return self.state_dir / MOUNT_CONFIG
