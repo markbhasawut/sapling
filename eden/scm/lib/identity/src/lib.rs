@@ -504,21 +504,14 @@ const TEST: Identity = Identity {
     },
 };
 
-#[cfg(all(not(feature = "sl_oss"), not(test)))]
+// Open-source (sl_oss) builds know .hg repos too: EdenFS checks out .hg working
+// copies and Mononoke serves hg clients, as they do internally.
+#[cfg(not(test))]
 mod idents {
     use super::*;
 
     pub fn all() -> &'static [Identity] {
         &[SL, HG]
-    }
-}
-
-#[cfg(feature = "sl_oss")]
-mod idents {
-    use super::*;
-
-    pub fn all() -> &'static [Identity] {
-        if in_test() { &[SL, HG] } else { &[SL] }
     }
 }
 
@@ -1239,9 +1232,7 @@ mod test {
         let sniff_dot_dirs: Vec<_> = sniff_idents().map(|i| i.sniff_dot_dir).collect();
         assert!(sniff_dot_dirs.contains(&SL.repo.sniff_dot_dir()));
         assert!(sniff_dot_dirs.contains(&SL_GIT.repo.sniff_dot_dir()));
-        if !cfg!(feature = "sl_oss") {
-            assert!(sniff_dot_dirs.contains(&HG.repo.sniff_dot_dir()));
-        }
+        assert!(sniff_dot_dirs.contains(&HG.repo.sniff_dot_dir()));
     }
 
     fn write_required_files(dir: &Path, ident: Identity) {
