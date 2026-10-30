@@ -3,6 +3,8 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
+add_subdirectory(trace)
+
 file(GLOB EDENFSCTL_SRCS "*.py" "doctor/*.py")
 
 if (IS_FB_BUILD)
