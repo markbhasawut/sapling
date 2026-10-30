@@ -1,6 +1,42 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
+# Run as a script (cmake -P), this is the patch step of a dependency that
+# fb_fetch_from_manifest() fetches: it applies getdeps' [build] patchfile to the
+# source in the working directory as getdeps does, from the git repo root with
+# git apply --ignore-space-change and the manifest's patchfile_opts, once (the
+# .getdeps_patched file records it).
+if(CMAKE_SCRIPT_MODE_FILE AND DEFINED FB_FETCH_APPLY_PATCH)
+  if(NOT EXISTS .getdeps_patched)
+    find_package(Git REQUIRED)
+    set(dir "${CMAKE_CURRENT_BINARY_DIR}")
+    execute_process(
+      COMMAND "${GIT_EXECUTABLE}" rev-parse --show-toplevel
+      OUTPUT_VARIABLE git_root OUTPUT_STRIP_TRAILING_WHITESPACE
+      RESULT_VARIABLE not_git ERROR_QUIET
+    )
+    if(NOT not_git)
+      set(dir "${git_root}")
+    endif()
+    separate_arguments(opts NATIVE_COMMAND "${FB_FETCH_PATCH_OPTS}")
+    message(STATUS "Patching with ${FB_FETCH_APPLY_PATCH} in ${dir}")
+    execute_process(
+      COMMAND "${GIT_EXECUTABLE}" apply --ignore-space-change ${opts}
+        "${FB_FETCH_APPLY_PATCH}"
+      WORKING_DIRECTORY "${dir}"
+      RESULT_VARIABLE failed
+    )
+    if(failed)
+      message(FATAL_ERROR "Failed to apply ${FB_FETCH_APPLY_PATCH}")
+    endif()
+    file(TOUCH .getdeps_patched)
+  endif()
+  return()
+endif()
+
 include(CMakePushCheckState)
+
+# This file, for the patch step to run.
+set(_FB_FETCH_MODULE "${CMAKE_CURRENT_LIST_FILE}")
 
 # getdeps' manifests sit next to this module, in fbsource and in the
 # build/fbcode_builder of each project that ships it.
@@ -98,6 +134,27 @@ function(fb_fetch_from_manifest name manifest)
   endif()
   if(subdir AND NOT subdir STREQUAL ".")
     list(APPEND source SOURCE_SUBDIR "${subdir}")
+  endif()
+  # getdeps patches the source with [build] patchfile before it builds it, so
+  # the copy fetched here gets the same patch, applied the same way.
+  fb_manifest_value(${manifest} build patchfile patchfile)
+  if(patchfile)
+    set(patch "${_FB_FETCH_FBCODE_BUILDER_DIR}/patches/${patchfile}")
+    if(NOT EXISTS "${patch}")
+      message(
+        FATAL_ERROR
+        "Can't fetch ${name}: getdeps' ${manifest} manifest patches it with "
+        "${patchfile}, which ${_FB_FETCH_FBCODE_BUILDER_DIR}/patches doesn't "
+        "have."
+      )
+    endif()
+    fb_manifest_value(${manifest} build patchfile_opts patchfile_opts)
+    list(
+      APPEND source PATCH_COMMAND "${CMAKE_COMMAND}"
+      "-DFB_FETCH_APPLY_PATCH=${patch}"
+      "-DFB_FETCH_PATCH_OPTS=${patchfile_opts}"
+      -P "${_FB_FETCH_MODULE}"
+    )
   endif()
   # Older CMake passes these on to ExternalProject, whose error doesn't say why.
   set(min_version "")
