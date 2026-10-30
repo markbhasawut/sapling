@@ -298,7 +298,9 @@ def config_file_for_dot_dir(dot_dir: str) -> str:
     return _dot_dir_config_file.get(dot_dir, "hgrc")
 
 
-def sniff_dot_dir(repo_root: Path) -> str:
+def sniff_dot_dir(repo_root: Path, default: Optional[str] = None) -> str:
+    """The dot dir that repo_root has, else the one the environment chooses, else
+    default, else ".hg"."""
     for dot_dir in _possible_dot_dirs:
         if (repo_root / dot_dir).exists():
             return dot_dir
@@ -313,4 +315,4 @@ def sniff_dot_dir(repo_root: Path) -> str:
     if env_ident in {"hg", "sl"}:
         return "." + env_ident
 
-    return _possible_dot_dirs[0]
+    return default or _possible_dot_dirs[0]
