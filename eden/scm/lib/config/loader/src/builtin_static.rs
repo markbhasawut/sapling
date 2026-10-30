@@ -60,7 +60,10 @@ pub(crate) fn builtin_system(
         configs.push(Arc::new(&production::CONFIG));
     }
 
-    if ident.cli_name() == "sl" && (!is_test || force_prod) {
+    // Without fb's static config, builtin:sapling stands in for it for hg as
+    // well as sl, so that both share the cache as internal builds do.
+    let sapling_static = ident.cli_name() == "sl" || cfg!(not(feature = "fb"));
+    if sapling_static && (!is_test || force_prod) {
         configs.push(Arc::new(&sapling::CONFIG));
     }
 
