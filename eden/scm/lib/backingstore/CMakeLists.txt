@@ -6,13 +6,19 @@
 rust_cxx_bridge(
   backingstore
   "src/ffi.rs"
+  CARGO_DIRECTORY "${CMAKE_SOURCE_DIR}/eden/fs/rust/edenfs-staticlib"
   LIBS
   fmt::fmt
   Folly::folly
 )
 
 # Open-source builds declare folly::IOBuf in a second bridge, see src/oss.rs.
-rust_cxx_bridge(backingstore_iobuf "src/oss.rs" LIBS Folly::folly)
+rust_cxx_bridge(
+  backingstore_iobuf
+  "src/oss.rs"
+  CARGO_DIRECTORY "${CMAKE_SOURCE_DIR}/eden/fs/rust/edenfs-staticlib"
+  LIBS Folly::folly
+)
 
 file(GLOB C_API_SRCS "src/*.cpp")
 file(GLOB C_API_HDRS "include/*.h")
@@ -46,7 +52,11 @@ target_link_libraries(
   Folly::folly
 )
 
-rust_cxx_header(rust_cxx LIBS rust_edenfs_staticlib)
+rust_cxx_header(
+  rust_cxx
+  CARGO_DIRECTORY "${CMAKE_SOURCE_DIR}/eden/fs/rust/edenfs-staticlib"
+  LIBS rust_edenfs_staticlib
+)
 
 # curl used in the Rust crate has its own copy of curl compiled and it uses
 # Crypt32 and Secur32 on Windows. We need to declare the link dependencies here

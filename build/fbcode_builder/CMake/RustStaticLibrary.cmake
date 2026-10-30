@@ -395,7 +395,8 @@ endfunction()
 #   `${TARGET}` CMake library target.
 #
 # ```cmake
-# rust_cxx_bridge(<TARGET> <CXX_BRIDGE_FILE> [CRATE <CRATE_NAME>] [LIBS <LIBNAMES>])
+# rust_cxx_bridge(<TARGET> <CXX_BRIDGE_FILE> [CRATE <CRATE_NAME>]
+#                 [CARGO_DIRECTORY <DIRECTORY>] [LIBS <LIBNAMES>])
 # ```
 #
 # Parameters:
@@ -406,11 +407,14 @@ endfunction()
 # - CRATE_NAME:
 #   Name of the crate. This parameter is optional. If unspecified, it will
 #   fallback to `${TARGET}`.
+# - CARGO_DIRECTORY:
+#   Directory where Cargo resolves the cxx dependency. Defaults to the current
+#   source directory.
 # - LIBS <lib1> [<lib2> ...]:
 #   A list of libraries that this library depends on.
 #
 function(rust_cxx_bridge TARGET CXX_BRIDGE_FILE)
-  fb_cmake_parse_args(ARG "" "CRATE" "LIBS" "${ARGN}")
+  fb_cmake_parse_args(ARG "" "CRATE;CARGO_DIRECTORY" "LIBS" "${ARGN}")
 
   if(DEFINED ARG_CRATE)
     set(crate_name "${ARG_CRATE}")
@@ -418,7 +422,9 @@ function(rust_cxx_bridge TARGET CXX_BRIDGE_FILE)
     set(crate_name "${TARGET}")
   endif()
 
-  _rust_cxxbridge(cxxbridge cxxbridge_target)
+  _rust_cxxbridge(
+    cxxbridge cxxbridge_target "${ARG_CARGO_DIRECTORY}"
+  )
 
   add_library(${crate_name} STATIC)
   target_include_directories(
@@ -482,7 +488,7 @@ endfunction()
 # source directory depends on.
 #
 # ```cmake
-# rust_cxx_header(<TARGET> [LIBS <LIBNAMES>])
+# rust_cxx_header(<TARGET> [CARGO_DIRECTORY <DIRECTORY>] [LIBS <LIBNAMES>])
 # ```
 #
 # Parameters:
@@ -490,14 +496,19 @@ endfunction()
 #   Name of the interface library target to create, which puts the header on
 #   the include path. An internal custom target, `${TARGET}.header`, generates
 #   it.
+# - CARGO_DIRECTORY:
+#   Directory where Cargo resolves the cxx dependency. Defaults to the current
+#   source directory.
 # - LIBS <lib1> [<lib2> ...]:
 #   A list of libraries that this library depends on, such as the Rust static
 #   library that contains the cxx runtime.
 #
 function(rust_cxx_header TARGET)
-  fb_cmake_parse_args(ARG "" "" "LIBS" "${ARGN}")
+  fb_cmake_parse_args(ARG "" "CARGO_DIRECTORY" "LIBS" "${ARGN}")
 
-  _rust_cxxbridge(cxxbridge cxxbridge_target)
+  _rust_cxxbridge(
+    cxxbridge cxxbridge_target "${ARG_CARGO_DIRECTORY}"
+  )
   add_custom_target(
     ${TARGET}.header
     DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/rust/cxx.h"
@@ -513,9 +524,13 @@ endfunction()
 # commands running it depend on, which runs `cargo install cxxbridge-cmd` when
 # no installed cxxbridge has that version. Also adds the rule that generates
 # `rust/cxx.h` in the current binary directory.
-function(_rust_cxxbridge CXXBRIDGE_VAR DEPENDS_VAR)
+function(_rust_cxxbridge CXXBRIDGE_VAR DEPENDS_VAR CARGO_DIRECTORY)
   if(USE_CARGO_VENDOR)
     set(extra_cargo_env "CARGO_HOME=${RUST_CARGO_HOME}")
+  endif()
+
+  if(NOT CARGO_DIRECTORY)
+    set(CARGO_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
   endif()
 
   execute_process(
@@ -523,7 +538,7 @@ function(_rust_cxxbridge CXXBRIDGE_VAR DEPENDS_VAR)
       "${CMAKE_COMMAND}" -E env
       ${extra_cargo_env}
       "${CARGO_COMMAND}" tree -i cxx --depth=0
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    WORKING_DIRECTORY "${CARGO_DIRECTORY}"
     RESULT_VARIABLE cxx_version_result
     OUTPUT_VARIABLE cxx_version_output
   )

@@ -22,6 +22,24 @@ target_link_libraries(
     Folly::folly
 )
 
+if(APPLE)
+  set_target_properties(
+    edenfs
+    PROPERTIES
+      LINK_LIBRARY_OVERRIDE_backingstore WHOLE_ARCHIVE
+      LINK_LIBRARY_OVERRIDE_backtrace_ffi WHOLE_ARCHIVE
+      LINK_LIBRARY_OVERRIDE_edenfs_ffi WHOLE_ARCHIVE
+      LINK_LIBRARY_OVERRIDE_manifold_ffi WHOLE_ARCHIVE
+      LINK_LIBRARY_OVERRIDE_redirect_ffi WHOLE_ARCHIVE
+  )
+  target_link_libraries(
+    edenfs
+      "-framework IOKit"
+      "-framework OpenDirectory"
+      "-framework SystemConfiguration"
+  )
+endif()
+
 if(NOT WIN32)
   add_executable(
     edenfs_privhelper

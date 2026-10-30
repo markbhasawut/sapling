@@ -6,6 +6,7 @@
 rust_cxx_bridge(
   edenfs_ffi
   "src/lib.rs"
+  CARGO_DIRECTORY "${CMAKE_SOURCE_DIR}/eden/fs/rust/edenfs-staticlib"
   LIBS
   fmt::fmt
   Folly::folly
