@@ -9,6 +9,7 @@ python_unittest(
         "corrupt_hg_test.py",
         "disk_usage_test.py",
         "doctor_test.py",
+        "network_test.py",
         "os_test.py",
         "util_test.py",
         "x509_test.py",
