@@ -275,11 +275,25 @@ pub mod facebook {
     #[cfg(not(fbcode_build))]
     pub use crate::oss_mysql::create_oss_mysql_connections;
     #[cfg(not(fbcode_build))]
+    pub use crate::oss_mysql::decide::Candidate;
+    #[cfg(not(fbcode_build))]
     pub use crate::oss_mysql::decide::PrimaryCheck;
     #[cfg(not(fbcode_build))]
     pub use crate::oss_mysql::endpoint::parse_oss_mysql_endpoint;
     #[cfg(not(fbcode_build))]
     pub use crate::oss_mysql::endpoint::parse_oss_mysql_hosts_file;
+    #[cfg(not(fbcode_build))]
+    pub use crate::oss_mysql::status::CandidateObservation;
+    #[cfg(not(fbcode_build))]
+    pub use crate::oss_mysql::status::CandidateStatus;
+    #[cfg(not(fbcode_build))]
+    pub use crate::oss_mysql::status::ClusterHealth;
+    #[cfg(not(fbcode_build))]
+    pub use crate::oss_mysql::status::ClusterStatus;
+    #[cfg(not(fbcode_build))]
+    pub use crate::oss_mysql::status::oss_mysql_cluster_status;
+    #[cfg(not(fbcode_build))]
+    pub use crate::oss_mysql::status::oss_mysql_cluster_statuses;
 
     /// MySQL global shared connection pool configuration.
     #[derive(Clone, Default)]

@@ -195,6 +195,10 @@ fn log_stats(state: &mut State, status: StatusCode) -> Option<()> {
                 PathHistory => STATS::path_history_duration_ms.add_value(dur_ms),
                 SetBookmark => STATS::set_bookmark_duration_ms.add_value(dur_ms),
                 ReplayIdenticalMoves => STATS::replay_identical_moves_duration_ms.add_value(dur_ms),
+                // Health reports are counted below with every other method,
+                // without a latency stat of their own.
+                #[cfg(not(fbcode_build))]
+                ServerHealth => {}
                 StreamingClone => STATS::streaming_clone_duration_ms.add_value(dur_ms),
                 SuffixQuery => STATS::suffix_query_duration_ms.add_value(dur_ms),
                 Trees => STATS::trees_duration_ms.add_value(dur_ms),

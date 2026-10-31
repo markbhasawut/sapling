@@ -419,6 +419,7 @@ impl Prober {
         self.log_round(cluster, &state, &actions, &observations, &failures);
         cluster.apply(&actions, new_credentials, unavailable_reason(&state));
         self.state = state;
+        cluster.record_round(&self.state, &observations, start);
         self.probed = true;
     }
 

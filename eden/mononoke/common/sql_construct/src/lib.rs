@@ -52,4 +52,6 @@ pub mod facebook {
     pub use crate::oss::FbSqlConstruct;
     #[cfg(not(fbcode_build))]
     pub use crate::oss::FbSqlShardedConstruct;
+    #[cfg(not(fbcode_build))]
+    pub use crate::oss::oss_mysql_target;
 }

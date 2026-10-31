@@ -132,6 +132,8 @@ pub enum SaplingRemoteApiMethod {
     Lookup,
     PathHistory,
     ReplayIdenticalMoves,
+    #[cfg(not(fbcode_build))]
+    ServerHealth,
     SetBookmark,
     StreamingClone,
     SuffixQuery,
@@ -185,6 +187,8 @@ impl fmt::Display for SaplingRemoteApiMethod {
             Self::Lookup => "lookup",
             Self::PathHistory => "path_history",
             Self::ReplayIdenticalMoves => "replay_identical_moves",
+            #[cfg(not(fbcode_build))]
+            Self::ServerHealth => "server_health",
             Self::SetBookmark => "set_bookmark",
             Self::StreamingClone => "streaming_clone",
             Self::SuffixQuery => "suffix_query",
@@ -306,6 +310,12 @@ define_handler!(
 );
 define_handler!(commit_revlog_data_handler, commit::revlog_data, [Hg]);
 define_handler!(repos_handler, repos::repos, [Hg]);
+#[cfg(not(fbcode_build))]
+define_handler!(
+    server_health_handler,
+    crate::server_health::server_health,
+    [Hg]
+);
 define_handler!(trees_handler, trees::trees, [Hg]);
 define_handler!(upload_file_handler, files::upload_file, [Hg]);
 
@@ -585,6 +595,11 @@ pub fn build_router<R: Send + Sync + Clone + 'static>(ctx: ServerContext<R>) -> 
             .get("/:repo/capabilities")
             .with_path_extractor::<capabilities::CapabilitiesParams>()
             .to(capabilities_handler);
+        #[cfg(not(fbcode_build))]
+        route
+            .get("/:repo/server_health")
+            .with_path_extractor::<crate::server_health::ServerHealthParams>()
+            .to(server_health_handler);
         route
             .post("/:repo/trees")
             .with_path_extractor::<trees::TreeParams>()
