@@ -19,6 +19,8 @@ sapling-auth = { version = "0.1.0", path = "../../auth" }
 sapling-configmodel = { version = "0.2.0", path = "../../config/model" }
 sapling-hg-http = { version = "0.1.0", path = "../../hg-http" }
 sapling-http-client = { version = "0.1.0", path = "../../http-client" }
+serde = { version = "1.0.229", features = ["derive", "rc"] }
+serde_json = { version = "1.0.154", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 thiserror = "2.0.21"
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 url = "2.5.8"
