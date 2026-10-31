@@ -657,6 +657,23 @@ fn repo_url(config: &dyn Config, endpoint: &str) -> Result<Url, Diagnosis> {
 }
 
 // Extract and parse URL from config with optional default if no config value.
+/// Whether the repo has a server for the network doctor to check: an
+/// `edenapi.url`, or a default path that is not on the local filesystem. A
+/// repo made with init, or cloned from a local path, has none.
+pub fn server_configured(config: &dyn Config) -> bool {
+    if config.get_nonempty("edenapi", "url").is_some() {
+        return true;
+    }
+    match config.get_nonempty("paths", "default") {
+        None => false,
+        Some(path) => match Url::parse(&path) {
+            // A one-letter scheme is a Windows drive letter, as in C:\repo.
+            Ok(url) => url.scheme() != "file" && url.scheme().len() > 1,
+            Err(_) => false,
+        },
+    }
+}
+
 fn config_url(
     config: &dyn Config,
     section: &str,
@@ -749,6 +766,29 @@ mod tests {
             let url = Url::parse("https://169.254.0.1:1234").unwrap();
             assert!(matches!(doc.check_host_tcp(&url), Err(HostError::TCP(_))))
         }
+    }
+
+    #[test]
+    fn test_server_configured() {
+        let configured = |pairs: &[(&'static str, &'static str)]| {
+            server_configured(&pairs.iter().copied().collect::<BTreeMap<_, _>>())
+        };
+        assert!(!configured(&[]));
+        assert!(!configured(&[("paths.default", "/home/alice/repo")]));
+        assert!(!configured(&[("paths.default", "../repo")]));
+        assert!(!configured(&[("paths.default", "file:///home/alice/repo")]));
+        assert!(!configured(&[("paths.default", r"C:\repo")]));
+        assert!(!configured(&[("paths.default", "")]));
+        assert!(configured(&[("paths.default", "mono:repo")]));
+        assert!(configured(&[("paths.default", "https://example.com/repo")]));
+        assert!(configured(&[(
+            "edenapi.url",
+            "https://example.com/edenapi/"
+        )]));
+        assert!(configured(&[
+            ("paths.default", "/home/alice/repo"),
+            ("edenapi.url", "https://example.com/edenapi/"),
+        ]));
     }
 
     #[test]

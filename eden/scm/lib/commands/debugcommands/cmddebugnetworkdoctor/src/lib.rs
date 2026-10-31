@@ -15,6 +15,13 @@ use cmdutil::Result;
 pub fn run(ctx: ReqCtx<NoOpts>, _repo: Option<&Repo>) -> Result<u8> {
     let config = ctx.config();
     let mut stdout = ctx.io().output();
+    if !network_doctor::server_configured(config) {
+        write!(
+            stdout,
+            "No server configured for this repo: there is no network to check.\n"
+        )?;
+        return Ok(0);
+    }
     match network_doctor::Doctor::new().diagnose(config) {
         Ok(()) => {
             write!(stdout, "No network problems detected.\n")?;
