@@ -46,6 +46,15 @@ impl SqlConstruct for SqlHgMutationStoreBuilder {
         {
             conn.set_isolation_level(Some(IsolationLevel::ReadCommitted));
         }
+        // OSS MySQL applies it to transactions only: autocommit statements
+        // keep the server's default.
+        if let Connection {
+            inner: SqlConnection::OssMysql(conn),
+            ..
+        } = &mut write_connection
+        {
+            conn.set_isolation_level(Some(IsolationLevel::ReadCommitted));
+        }
         Self {
             connections: SqlConnections {
                 read_connection,

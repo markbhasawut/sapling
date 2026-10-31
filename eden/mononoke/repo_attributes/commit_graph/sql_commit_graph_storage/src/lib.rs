@@ -63,6 +63,7 @@ use sql_ext::Connection;
 use sql_ext::SqlConnections;
 use sql_ext::SqlQueryTelemetry;
 use sql_ext::mononoke_queries;
+use sql_ext::retry_transaction;
 use sql_ext::should_retry_query;
 use vec1::Vec1;
 use vec1::vec1;
@@ -106,6 +107,15 @@ impl SqlConstruct for SqlCommitGraphStorageBuilder {
 
         if let Connection {
             inner: SqlConnection::Mysql(conn),
+            ..
+        } = &mut write_connection
+        {
+            conn.set_isolation_level(Some(IsolationLevel::ReadCommitted));
+        }
+        // OSS MySQL applies it to transactions only: autocommit statements
+        // keep the server's default.
+        if let Connection {
+            inner: SqlConnection::OssMysql(conn),
             ..
         } = &mut write_connection
         {
@@ -1892,6 +1902,160 @@ impl SqlCommitGraphStorage {
         Ok(result.first().map_or(0, |(count,)| *count))
     }
 
+    /// Adds the edges of one changeset in one transaction. Returns whether
+    /// they were added, rather than present already.
+    async fn _add(&self, ctx: &CoreContext, edges: &ChangesetEdges) -> Result<bool> {
+        let merge_parent_cs_id_to_id: HashMap<ChangesetId, u64> = if edges.parent_count() >= 2 {
+            ctx.perf_counters()
+                .increment_counter(PerfCounterType::SqlReadsReplica);
+            SelectManyIds::query(
+                &self.read_connection.conn,
+                ctx.sql_query_telemetry(),
+                &self.repo_identity.id(),
+                &edges
+                    .parents::<Parents>()
+                    .map(|node| node.cs_id)
+                    .collect::<Vec<_>>(),
+            )
+            .await?
+            .into_iter()
+            .collect()
+        } else {
+            Default::default()
+        };
+
+        let subtree_source_cs_id_to_id: HashMap<ChangesetId, u64> =
+            if edges.subtree_source_count() == 0 {
+                Default::default()
+            } else {
+                ctx.perf_counters()
+                    .increment_counter(PerfCounterType::SqlReadsReplica);
+                SelectManyIds::query(
+                    &self.read_connection.conn,
+                    ctx.sql_query_telemetry(),
+                    &self.repo_identity.id(),
+                    &edges
+                        .subtree_sources()
+                        .map(|node| node.cs_id)
+                        .collect::<Vec<_>>(),
+                )
+                .await?
+                .into_iter()
+                .collect()
+            };
+
+        let transaction = self
+            .write_connection
+            .start_transaction(ctx.sql_query_telemetry())
+            .await?;
+
+        let (transaction, result) = InsertChangeset::query_with_transaction(
+            transaction,
+            &self.repo_identity.id(),
+            &edges.node().cs_id,
+            &edges.node().generation::<Parents>().value(),
+            &edges
+                .node()
+                .generation::<ParentsAndSubtreeSources>()
+                .value(),
+            &edges.node().skip_tree_depth::<Parents>(),
+            &edges.node().skip_tree_depth::<FirstParentLinear>(),
+            &edges.node().skip_tree_depth::<ParentsAndSubtreeSources>(),
+            &edges.parent_count(),
+            &edges.subtree_source_count(),
+            &edges.parents::<Parents>().next().map(|node| node.cs_id),
+            &edges
+                .merge_ancestor_or_root::<Parents>()
+                .map(|node| node.cs_id),
+            &edges.skip_tree_parent::<Parents>().map(|node| node.cs_id),
+            &edges
+                .skip_tree_skew_ancestor::<Parents>()
+                .map(|node| node.cs_id),
+            &edges
+                .skip_tree_skew_ancestor::<FirstParentLinear>()
+                .map(|node| node.cs_id),
+            &edges
+                .merge_ancestor_or_root::<ParentsAndSubtreeSources>()
+                .map(|node| node.cs_id),
+            &edges
+                .skip_tree_parent::<ParentsAndSubtreeSources>()
+                .map(|node| node.cs_id),
+            &edges
+                .skip_tree_skew_ancestor::<ParentsAndSubtreeSources>()
+                .map(|node| node.cs_id),
+        )
+        .await?;
+
+        match result.last_insert_id() {
+            Some(last_insert_id) if result.affected_rows() == 1 => {
+                let merge_parent_rows = edges
+                    .parents::<Parents>()
+                    .enumerate()
+                    .skip(1)
+                    .map(|(parent_num, node)| {
+                        Ok((
+                            last_insert_id,
+                            parent_num,
+                            *merge_parent_cs_id_to_id
+                                .get(&node.cs_id)
+                                .ok_or_else(|| anyhow!("Failed to fetch id for {}", node.cs_id))?,
+                            self.repo_identity.id(),
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+
+                let (transaction, result) = InsertMergeParents::query_with_transaction(
+                    transaction,
+                    // This pattern is used to convert a ref to tuple into a tuple of refs.
+                    #[allow(clippy::map_identity)]
+                    merge_parent_rows
+                        .iter()
+                        .map(|(a, b, c, d)| (a, b, c, d))
+                        .collect::<Vec<_>>()
+                        .as_slice(),
+                )
+                .await?;
+
+                let subtree_source_rows = edges
+                    .subtree_sources()
+                    .enumerate()
+                    .map(|(subtree_source_num, node)| {
+                        Ok((
+                            last_insert_id,
+                            subtree_source_num,
+                            *subtree_source_cs_id_to_id
+                                .get(&node.cs_id)
+                                .ok_or_else(|| anyhow!("Failed to fetch id for {}", node.cs_id))?,
+                            self.repo_identity.id(),
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+
+                let (transaction, result) = InsertSubtreeSources::query_with_transaction(
+                    transaction,
+                    // This pattern is used to convert a ref to tuple into a tuple of refs.
+                    #[allow(clippy::map_identity)]
+                    subtree_source_rows
+                        .iter()
+                        .map(|(a, b, c, d)| (a, b, c, d))
+                        .collect::<Vec<_>>()
+                        .as_slice(),
+                )
+                .await?;
+
+                transaction.commit().await?;
+                ctx.perf_counters()
+                    .increment_counter(PerfCounterType::SqlWrites);
+
+                Ok(true)
+            }
+            _ => {
+                transaction.rollback().await?;
+                Ok(false)
+            }
+        }
+    }
+
     async fn _add_many(
         &self,
         ctx: &CoreContext,
@@ -2101,155 +2265,9 @@ impl CommitGraphStorage for SqlCommitGraphStorage {
     }
 
     async fn add(&self, ctx: &CoreContext, edges: ChangesetEdges) -> Result<bool> {
-        let merge_parent_cs_id_to_id: HashMap<ChangesetId, u64> = if edges.parent_count() >= 2 {
-            ctx.perf_counters()
-                .increment_counter(PerfCounterType::SqlReadsReplica);
-            SelectManyIds::query(
-                &self.read_connection.conn,
-                ctx.sql_query_telemetry(),
-                &self.repo_identity.id(),
-                &edges
-                    .parents::<Parents>()
-                    .map(|node| node.cs_id)
-                    .collect::<Vec<_>>(),
-            )
-            .await?
-            .into_iter()
-            .collect()
-        } else {
-            Default::default()
-        };
-
-        let subtree_source_cs_id_to_id: HashMap<ChangesetId, u64> =
-            if edges.subtree_source_count() == 0 {
-                Default::default()
-            } else {
-                ctx.perf_counters()
-                    .increment_counter(PerfCounterType::SqlReadsReplica);
-                SelectManyIds::query(
-                    &self.read_connection.conn,
-                    ctx.sql_query_telemetry(),
-                    &self.repo_identity.id(),
-                    &edges
-                        .subtree_sources()
-                        .map(|node| node.cs_id)
-                        .collect::<Vec<_>>(),
-                )
-                .await?
-                .into_iter()
-                .collect()
-            };
-
-        let transaction = self
-            .write_connection
-            .start_transaction(ctx.sql_query_telemetry())
-            .await?;
-
-        let (transaction, result) = InsertChangeset::query_with_transaction(
-            transaction,
-            &self.repo_identity.id(),
-            &edges.node().cs_id,
-            &edges.node().generation::<Parents>().value(),
-            &edges
-                .node()
-                .generation::<ParentsAndSubtreeSources>()
-                .value(),
-            &edges.node().skip_tree_depth::<Parents>(),
-            &edges.node().skip_tree_depth::<FirstParentLinear>(),
-            &edges.node().skip_tree_depth::<ParentsAndSubtreeSources>(),
-            &edges.parent_count(),
-            &edges.subtree_source_count(),
-            &edges.parents::<Parents>().next().map(|node| node.cs_id),
-            &edges
-                .merge_ancestor_or_root::<Parents>()
-                .map(|node| node.cs_id),
-            &edges.skip_tree_parent::<Parents>().map(|node| node.cs_id),
-            &edges
-                .skip_tree_skew_ancestor::<Parents>()
-                .map(|node| node.cs_id),
-            &edges
-                .skip_tree_skew_ancestor::<FirstParentLinear>()
-                .map(|node| node.cs_id),
-            &edges
-                .merge_ancestor_or_root::<ParentsAndSubtreeSources>()
-                .map(|node| node.cs_id),
-            &edges
-                .skip_tree_parent::<ParentsAndSubtreeSources>()
-                .map(|node| node.cs_id),
-            &edges
-                .skip_tree_skew_ancestor::<ParentsAndSubtreeSources>()
-                .map(|node| node.cs_id),
-        )
-        .await?;
-
-        match result.last_insert_id() {
-            Some(last_insert_id) if result.affected_rows() == 1 => {
-                let merge_parent_rows = edges
-                    .parents::<Parents>()
-                    .enumerate()
-                    .skip(1)
-                    .map(|(parent_num, node)| {
-                        Ok((
-                            last_insert_id,
-                            parent_num,
-                            *merge_parent_cs_id_to_id
-                                .get(&node.cs_id)
-                                .ok_or_else(|| anyhow!("Failed to fetch id for {}", node.cs_id))?,
-                            self.repo_identity.id(),
-                        ))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-
-                let (transaction, result) = InsertMergeParents::query_with_transaction(
-                    transaction,
-                    // This pattern is used to convert a ref to tuple into a tuple of refs.
-                    #[allow(clippy::map_identity)]
-                    merge_parent_rows
-                        .iter()
-                        .map(|(a, b, c, d)| (a, b, c, d))
-                        .collect::<Vec<_>>()
-                        .as_slice(),
-                )
-                .await?;
-
-                let subtree_source_rows = edges
-                    .subtree_sources()
-                    .enumerate()
-                    .map(|(subtree_source_num, node)| {
-                        Ok((
-                            last_insert_id,
-                            subtree_source_num,
-                            *subtree_source_cs_id_to_id
-                                .get(&node.cs_id)
-                                .ok_or_else(|| anyhow!("Failed to fetch id for {}", node.cs_id))?,
-                            self.repo_identity.id(),
-                        ))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-
-                let (transaction, result) = InsertSubtreeSources::query_with_transaction(
-                    transaction,
-                    // This pattern is used to convert a ref to tuple into a tuple of refs.
-                    #[allow(clippy::map_identity)]
-                    subtree_source_rows
-                        .iter()
-                        .map(|(a, b, c, d)| (a, b, c, d))
-                        .collect::<Vec<_>>()
-                        .as_slice(),
-                )
-                .await?;
-
-                transaction.commit().await?;
-                ctx.perf_counters()
-                    .increment_counter(PerfCounterType::SqlWrites);
-
-                Ok(true)
-            }
-            _ => {
-                transaction.rollback().await?;
-                Ok(false)
-            }
-        }
+        // OSS builds run the transaction again when it committed nothing, as
+        // when the MySQL primary is demoted while it is open.
+        retry_transaction("commit graph add", |_| self._add(ctx, &edges)).await
     }
 
     async fn fetch_edges(&self, ctx: &CoreContext, cs_id: ChangesetId) -> Result<ChangesetEdges> {

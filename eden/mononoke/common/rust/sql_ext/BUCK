@@ -15,19 +15,19 @@ rust_library(
     },
     test_deps = [
         "fbsource//third-party/rust:assert_matches",
+        "fbsource//third-party/rust:tempfile",
+        "//common/rust/shed/fbinit:fbinit-tokio",
+        "//eden/mononoke/common/metadata:metadata",
+        "//eden/mononoke/common/mononoke_macros:mononoke_macros",
     ]
     + (
         []
         if rust_oss.is_oss_build()
         else [
             "fbsource//third-party/rust:pretty_assertions",
-            "fbsource//third-party/rust:tempfile",
-            "//common/rust/shed/fbinit:fbinit-tokio",
             "//common/rust/shed/sql:sql_tests_lib",
             "//dsi/logger/configs/MononokeXdbTelemetryLoggerConfig:log_entry-rust",
             "//dsi/logger/rust/mock_transport:mock_transport",
-            "//eden/mononoke/common/metadata:metadata",
-            "//eden/mononoke/common/mononoke_macros:mononoke_macros",
         ]
     ),
     deps = (
@@ -38,6 +38,7 @@ rust_library(
             "fbsource//third-party/rust:bincode",
             "fbsource//third-party/rust:bytes",
             "fbsource//third-party/rust:derivative",
+            "fbsource//third-party/rust:futures",
             "fbsource//third-party/rust:itertools",
             "fbsource//third-party/rust:maplit",
             "fbsource//third-party/rust:paste",
@@ -78,7 +79,6 @@ rust_library(
             else [
                 "fbsource//third-party/rust:aws-config",
                 "fbsource//third-party/rust:aws-sdk-secretsmanager",
-                "fbsource//third-party/rust:futures",
                 "fbsource//third-party/rust:mysql_async",
                 "fbsource//third-party/rust:vec1",
                 "//common/rust/shed/stats:stats",

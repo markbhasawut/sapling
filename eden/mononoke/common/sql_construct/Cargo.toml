@@ -16,5 +16,9 @@ sql = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-s
 sql_ext = { version = "0.1.0", path = "../rust/sql_ext" }
 vec1 = { version = "1.12.1", features = ["serde"] }
 
+[dev-dependencies]
+mononoke_macros = { version = "0.1.0", path = "../mononoke_macros" }
+tokio = { version = "1.54.1", features = ["full", "test-util", "tracing"] }
+
 [lints]
 workspace = true

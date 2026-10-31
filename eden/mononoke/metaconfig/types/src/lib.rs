@@ -1591,8 +1591,9 @@ pub struct RemoteDatabaseConfig {
     pub db_address: String,
 }
 
-/// Configuration for a remote OSS MySQL database
-#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+/// Configuration for a remote OSS MySQL database. Its `Debug` output hides
+/// secret references that may hold the secret itself.
+#[derive(Clone, Eq, PartialEq, Hash)]
 pub struct OssRemoteDatabaseConfig {
     /// Host to connect to
     pub host: String,
@@ -1604,6 +1605,70 @@ pub struct OssRemoteDatabaseConfig {
     pub user_secret: String,
     /// Name of the password secret
     pub password_secret: String,
+    /// Candidate servers, in order: the configured `hosts`, or `host:port`
+    /// when `hosts` is absent. Never empty.
+    pub endpoints: Vec<OssDbEndpoint>,
+    /// File listing candidate servers. Its contents, when readable and
+    /// valid, take precedence over `endpoints`.
+    pub hosts_file: Option<PathBuf>,
+}
+
+impl fmt::Debug for OssRemoteDatabaseConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OssRemoteDatabaseConfig")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("database", &self.database)
+            .field("user_secret", &RedactedSecretReference(&self.user_secret))
+            .field(
+                "password_secret",
+                &RedactedSecretReference(&self.password_secret),
+            )
+            .field("endpoints", &self.endpoints)
+            .field("hosts_file", &self.hosts_file)
+            .finish()
+    }
+}
+
+/// A secret reference, whose `Debug` output hides the value of a `literal:`
+/// reference. `env:`, `file:` and `aws-sm:` references name where the value
+/// is kept, and are printed as they are. Other references, bare names
+/// included, are hidden too: OSS builds do not echo them in errors either,
+/// as they may be a password written without `literal:`.
+struct RedactedSecretReference<'a>(&'a str);
+
+impl fmt::Debug for RedactedSecretReference<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.0.starts_with("literal:") {
+            fmt::Debug::fmt("literal:<redacted>", f)
+        } else if ["env:", "file:", "aws-sm:"]
+            .iter()
+            .any(|form| self.0.starts_with(form))
+        {
+            fmt::Debug::fmt(self.0, f)
+        } else {
+            fmt::Debug::fmt("<redacted>", f)
+        }
+    }
+}
+
+/// One candidate server of a remote OSS MySQL database
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub struct OssDbEndpoint {
+    /// Host name or IP address (IPv6 without brackets)
+    pub host: String,
+    /// TCP port
+    pub port: u16,
+}
+
+impl fmt::Display for OssDbEndpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.host.contains(':') {
+            write!(f, "[{}]:{}", self.host, self.port)
+        } else {
+            write!(f, "{}:{}", self.host, self.port)
+        }
+    }
 }
 
 /// Configuration for a sharded remote MySQL database
@@ -3112,5 +3177,81 @@ mod tests {
     #[mononoke::test]
     fn test_acl_manifest_mode_default_is_disabled() {
         assert_eq!(AclManifestMode::default(), AclManifestMode::Disabled);
+    }
+
+    fn oss_remote_database(user_secret: &str, password_secret: &str) -> OssRemoteDatabaseConfig {
+        OssRemoteDatabaseConfig {
+            host: "db1".to_string(),
+            port: 3306,
+            database: "mononoke".to_string(),
+            user_secret: user_secret.to_string(),
+            password_secret: password_secret.to_string(),
+            endpoints: vec![OssDbEndpoint {
+                host: "db1".to_string(),
+                port: 3306,
+            }],
+            hosts_file: Some(PathBuf::from("/etc/mononoke/mysql-hosts")),
+        }
+    }
+
+    // What it tests: the Debug output of storage configs, which is logged.
+    // Expected: literal: secret values are hidden, and so are references of
+    // no known form, bare names included, which may be a password written
+    // without literal:. env:, file: and aws-sm: references and the other
+    // fields are printed.
+    #[mononoke::test]
+    fn test_debug_hides_literal_secrets() {
+        let literal = oss_remote_database("literal:mononoke-user", "literal:s3cret");
+        let file = oss_remote_database("env:MYSQL_USER", "file:/etc/mononoke/mysql.pw");
+        let storage = StorageConfig {
+            metadata: MetadataDatabaseConfig::OssRemote(OssRemoteMetadataDatabaseConfig {
+                production: literal.clone(),
+                commit_graph: literal.clone(),
+                bookmarks: literal.clone(),
+                bonsai_hg_mapping: literal.clone(),
+                filenodes: literal.clone(),
+                mutation: literal.clone(),
+                sparse_profiles: file.clone(),
+                bonsai_blob_mapping: Some(literal.clone()),
+                deletion_log: None,
+                commit_derived_data_mapping: Some(literal),
+            }),
+            ..Default::default()
+        };
+        for debug in [format!("{storage:?}"), format!("{storage:#?}")] {
+            assert!(!debug.contains("s3cret"), "{debug}");
+            assert!(!debug.contains("mononoke-user"), "{debug}");
+            assert!(debug.contains(r#""literal:<redacted>""#), "{debug}");
+            assert!(
+                debug.contains(r#""file:/etc/mononoke/mysql.pw""#),
+                "{debug}"
+            );
+            assert!(debug.contains(r#""env:MYSQL_USER""#), "{debug}");
+        }
+        assert_eq!(
+            format!("{file:?}"),
+            "OssRemoteDatabaseConfig { host: \"db1\", port: 3306, database: \"mononoke\", \
+             user_secret: \"env:MYSQL_USER\", password_secret: \"file:/etc/mononoke/mysql.pw\", \
+             endpoints: [OssDbEndpoint { host: \"db1\", port: 3306 }], \
+             hosts_file: Some(\"/etc/mononoke/mysql-hosts\") }"
+        );
+
+        // A password that lacks literal:, as a bare name or in no known form.
+        for (user_secret, password_secret) in
+            [("mononoke", "hunter2"), ("aws-sm:mononoke", "p4ss:w0rd")]
+        {
+            let debug = format!("{:?}", oss_remote_database(user_secret, password_secret));
+            assert!(!debug.contains(password_secret), "{debug}");
+            assert!(
+                debug.contains(r#"password_secret: "<redacted>""#),
+                "{debug}"
+            );
+        }
+        let debug = format!("{:?}", oss_remote_database("mononoke", "aws-sm:mysql"));
+        assert!(debug.contains(r#"user_secret: "<redacted>""#), "{debug}");
+        assert!(
+            debug.contains(r#"password_secret: "aws-sm:mysql""#),
+            "{debug}"
+        );
     }
 }

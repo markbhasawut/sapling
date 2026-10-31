@@ -905,94 +905,110 @@ impl BookmarkTransaction for SqlBookmarksTransaction {
             .increment_counter(PerfCounterType::SqlWrites);
 
         async move {
-            let mut attempt = 0;
-            let result: Result<(sql_ext::Transaction, u64), _> = loop {
-                attempt += 1;
-
-                let mut txn = write_connection
-                    .start_transaction(ctx.sql_query_telemetry())
-                    .await?;
-
-                txn = match run_transaction_hooks(&ctx, txn, &txn_hooks).await {
-                    Ok(txn) => txn,
-                    Err(BookmarkTransactionError::RetryableError(_))
-                        if attempt < MAX_BOOKMARK_TRANSACTION_ATTEMPT_COUNT =>
-                    {
-                        continue;
-                    }
-                    Err(err) => break Err(err),
-                };
-
-                match payload.attempt_write(&ctx, txn).await {
-                    Err(BookmarkTransactionError::RetryableError(_))
-                        if attempt < MAX_BOOKMARK_TRANSACTION_ATTEMPT_COUNT =>
-                    {
-                        continue;
-                    }
-                    result => break result,
-                }
-            };
-
-            // The number of `RetryableError`'s that were encountered
-            let mut retryable_errors = attempt as i64 - 1;
-            let result = match result {
-                Ok((txn, log_id)) => {
-                    STATS::bookmarks_update_log_insert_success.add_value(1);
-                    STATS::bookmarks_update_log_insert_success_attempt_count
-                        .add_value(attempt as i64);
-                    txn.commit().await?;
-                    Ok(Some(log_id))
-                }
-                Err(BookmarkTransactionError::LogicError) => {
-                    // Logic error signifies that the transaction was rolled
-                    // back, which likely means that bookmark has moved since
-                    // our pushrebase finished. We need to retry the pushrebase
-                    // Attempt count means one more than the number of `RetryableError`
-                    // we hit before seeing this.
-                    STATS::bookmarks_insert_logic_error.add_value(1);
-                    STATS::bookmarks_insert_logic_error_attempt_count.add_value(attempt as i64);
-                    Ok(None)
-                }
-                Err(BookmarkTransactionError::AlreadyProcessed) => {
-                    // A modern_sync mirror move was already applied on the
-                    // replica (a lost-ack replay). The transaction is rolled
-                    // back. Report a distinct error so higher layers map it to a
-                    // response code that tells modern_sync to advance its
-                    // checkpoint instead of retrying forever.
-                    STATS::bookmarks_insert_already_processed.add_value(1);
-                    Err(BookmarkMoveAlreadyProcessed.into())
-                }
-                Err(BookmarkTransactionError::RetryableError(err)) => {
-                    // Attempt count for `RetryableError` should always be equal
-                    // to the MAX_BOOKMARK_TRANSACTION_ATTEMPT_COUNT, and hitting
-                    // this error here basically means that this number of attempts
-                    // was not enough, or the error was misclassified
-                    STATS::bookmarks_insert_retryable_error.add_value(1);
-                    STATS::bookmarks_insert_retryable_error_attempt_count.add_value(attempt as i64);
-                    retryable_errors += 1;
-                    Err(err)
-                }
-                Err(BookmarkTransactionError::Other(err)) => {
-                    // `Other` error captures what we consider an "infrastructure"
-                    // error, e.g. xdb went down during this transaction.
-                    // Attempt count > 1 means the before we hit this error,
-                    // we hit `RetryableError` a attempt count - 1 times.
-                    STATS::bookmarks_insert_other_error.add_value(1);
-                    STATS::bookmarks_insert_other_error_attempt_count.add_value(attempt as i64);
-                    Err(err)
-                }
-            };
-            STATS::bookmarks_update_log_insert_retry.add_value(retryable_errors);
-            result
+            // OSS builds run the whole transaction again when it committed
+            // nothing, as when the MySQL primary is demoted while it is open.
+            sql_ext::retry_transaction("bookmarks", |_| {
+                commit_attempt(&ctx, &write_connection, &txn_hooks, &payload)
+            })
+            .await
         }
         .boxed()
     }
 }
 
+/// Runs the bookmark transaction once, retrying it right away while it fails
+/// with a `RetryableError`. Returns the id of the first log entry it wrote,
+/// or `None` if a bookmark was not where the transaction expected it.
+async fn commit_attempt(
+    ctx: &CoreContext,
+    write_connection: &Connection,
+    txn_hooks: &[BookmarkTransactionHook],
+    payload: &SqlBookmarksTransactionPayload,
+) -> Result<Option<u64>> {
+    let mut attempt = 0;
+    let result: Result<(sql_ext::Transaction, u64), _> = loop {
+        attempt += 1;
+
+        let mut txn = write_connection
+            .start_transaction(ctx.sql_query_telemetry())
+            .await?;
+
+        txn = match run_transaction_hooks(ctx, txn, txn_hooks).await {
+            Ok(txn) => txn,
+            Err(BookmarkTransactionError::RetryableError(_))
+                if attempt < MAX_BOOKMARK_TRANSACTION_ATTEMPT_COUNT =>
+            {
+                continue;
+            }
+            Err(err) => break Err(err),
+        };
+
+        match payload.attempt_write(ctx, txn).await {
+            Err(BookmarkTransactionError::RetryableError(_))
+                if attempt < MAX_BOOKMARK_TRANSACTION_ATTEMPT_COUNT =>
+            {
+                continue;
+            }
+            result => break result,
+        }
+    };
+
+    // The number of `RetryableError`'s that were encountered
+    let mut retryable_errors = attempt as i64 - 1;
+    let result = match result {
+        Ok((txn, log_id)) => {
+            STATS::bookmarks_update_log_insert_success.add_value(1);
+            STATS::bookmarks_update_log_insert_success_attempt_count.add_value(attempt as i64);
+            txn.commit().await?;
+            Ok(Some(log_id))
+        }
+        Err(BookmarkTransactionError::LogicError) => {
+            // Logic error signifies that the transaction was rolled
+            // back, which likely means that bookmark has moved since
+            // our pushrebase finished. We need to retry the pushrebase
+            // Attempt count means one more than the number of `RetryableError`
+            // we hit before seeing this.
+            STATS::bookmarks_insert_logic_error.add_value(1);
+            STATS::bookmarks_insert_logic_error_attempt_count.add_value(attempt as i64);
+            Ok(None)
+        }
+        Err(BookmarkTransactionError::AlreadyProcessed) => {
+            // A modern_sync mirror move was already applied on the
+            // replica (a lost-ack replay). The transaction is rolled
+            // back. Report a distinct error so higher layers map it to a
+            // response code that tells modern_sync to advance its
+            // checkpoint instead of retrying forever.
+            STATS::bookmarks_insert_already_processed.add_value(1);
+            Err(BookmarkMoveAlreadyProcessed.into())
+        }
+        Err(BookmarkTransactionError::RetryableError(err)) => {
+            // Attempt count for `RetryableError` should always be equal
+            // to the MAX_BOOKMARK_TRANSACTION_ATTEMPT_COUNT, and hitting
+            // this error here basically means that this number of attempts
+            // was not enough, or the error was misclassified
+            STATS::bookmarks_insert_retryable_error.add_value(1);
+            STATS::bookmarks_insert_retryable_error_attempt_count.add_value(attempt as i64);
+            retryable_errors += 1;
+            Err(err)
+        }
+        Err(BookmarkTransactionError::Other(err)) => {
+            // `Other` error captures what we consider an "infrastructure"
+            // error, e.g. xdb went down during this transaction.
+            // Attempt count > 1 means the before we hit this error,
+            // we hit `RetryableError` a attempt count - 1 times.
+            STATS::bookmarks_insert_other_error.add_value(1);
+            STATS::bookmarks_insert_other_error_attempt_count.add_value(attempt as i64);
+            Err(err)
+        }
+    };
+    STATS::bookmarks_update_log_insert_retry.add_value(retryable_errors);
+    result
+}
+
 async fn run_transaction_hooks(
     ctx: &CoreContext,
     mut txn: sql_ext::Transaction,
-    txn_hooks: &Vec<BookmarkTransactionHook>,
+    txn_hooks: &[BookmarkTransactionHook],
 ) -> Result<sql_ext::Transaction, BookmarkTransactionError> {
     for txn_hook in txn_hooks {
         txn = txn_hook(ctx.clone(), txn).await?;

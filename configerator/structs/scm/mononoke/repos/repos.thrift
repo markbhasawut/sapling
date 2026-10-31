@@ -980,6 +980,19 @@ struct RawOssDbRemote {
   // 6: deleted
   7: string password_secret;
   8: string user_secret;
+  // Candidate servers, in the forms "host", "host:port", "[v6]" or
+  // "[v6]:port". The port defaults to `port`. When absent, `host`:`port` is
+  // the only candidate. Connections do not use TLS, and Mononoke logs in to
+  // every candidate: whoever answers on a candidate's address can recover
+  // the password. List only servers on a trusted network.
+  9: optional list<string> hosts;
+  // Absolute path of a file listing candidate servers, one per line in the
+  // same forms as `hosts` (blank lines and lines starting with '#' are
+  // ignored). It is re-read while running and takes precedence over `hosts`
+  // whenever it yields a valid, non-empty list. As with `hosts`, every
+  // server listed can recover the password, so only its owner should be
+  // able to write it; Mononoke warns when others can.
+  10: optional string hosts_file;
 }
 
 @rust.Exhaustive
