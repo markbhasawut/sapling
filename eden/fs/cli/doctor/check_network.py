@@ -10,7 +10,7 @@ import os
 import re
 import subprocess
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 from eden.fs.cli.doctor.problem import Problem, ProblemSeverity, ProblemTracker
 from eden.fs.cli.util import get_environment_suitable_for_subprocess
@@ -26,6 +26,12 @@ except ImportError:
 NETWORK_TIMEOUT = 15.0
 MIN_DOWNLOAD_SPEED = 50.0
 MIN_UPLOAD_SPEED = 10.0
+
+# The diagnosis 'sl debugnetworkdoctor' prints when the Mononoke server reports
+# itself unhealthy.
+SERVER_HEALTH_RE: re.Pattern[str] = re.compile(
+    r"^server reports (degraded|down) health: (.*)$", re.MULTILINE
+)
 
 
 class NetworkSpeedProblem(Problem):
@@ -61,6 +67,31 @@ class ConnectivityProblem(Problem):
             remediation="Please check your network connection. If you are connected to the VPN, please try reconnecting.",
             severity=ProblemSeverity.ERROR,
         )
+
+
+class ServerHealthProblem(Problem):
+    def __init__(self, status: str, summary: str) -> None:
+        super().__init__(
+            f"Mononoke server reports {status} health: {summary}",
+            remediation="This is a problem on the Mononoke server, not on this machine. "
+            "Retry later, and contact the server's administrators if it persists.",
+            severity=(
+                ProblemSeverity.ERROR
+                if status == "down"
+                else ProblemSeverity.POTENTIALLY_SERIOUS
+            ),
+        )
+
+
+def parse_server_health(stdout: str | bytes | None) -> Optional[ServerHealthProblem]:
+    if stdout is None:
+        return None
+    if isinstance(stdout, bytes):
+        stdout = stdout.decode("utf-8", errors="replace")
+    match = SERVER_HEALTH_RE.search(stdout)
+    if match is None:
+        return None
+    return ServerHealthProblem(match.group(1), match.group(2))
 
 
 def form_network_speed_message(download_speed: float, upload_speed: float) -> str:
@@ -132,6 +163,10 @@ class NetworkChecker:
         try:
             self.run_command([hg, "debugnetworkdoctor"], checkout_backing_repo)
         except subprocess.CalledProcessError as ex:
+            server_health_problem = parse_server_health(ex.stdout)
+            if server_health_problem is not None:
+                tracker.add_problem(server_health_problem)
+                return
             tracker.add_problem(
                 ConnectivityProblem(
                     fmtProblemMessage(
