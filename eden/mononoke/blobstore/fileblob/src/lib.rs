@@ -105,6 +105,33 @@ async fn ctime(file: &File) -> Option<i64> {
     i64::try_from(ctime_dur.as_secs()).ok()
 }
 
+/// Flush a blob's contents to disk before it is renamed into place.
+///
+/// On Apple platforms `sync_all()` is `fcntl(F_FULLFSYNC)`, which also empties
+/// the drive's write cache and costs milliseconds per blob. Use fsync(2) there,
+/// which is what `sync_all()` does on Linux.
+async fn sync_to_disk(file: File) -> io::Result<()> {
+    #[cfg(target_vendor = "apple")]
+    {
+        use std::os::fd::AsRawFd;
+
+        let file = file.into_std().await;
+        mononoke::spawn_blocking(move || {
+            // SAFETY: `file` keeps the descriptor open until fsync returns.
+            if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        })
+        .await?
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        file.sync_all().await
+    }
+}
+
 #[async_trait]
 impl Blobstore for Fileblob {
     async fn get<'a>(
@@ -143,7 +170,7 @@ impl Blobstore for Fileblob {
         let mut tokio_file = File::from_std(new_file);
         tokio_file.write_all(value.as_bytes().as_ref()).await?;
         tokio_file.flush().await?;
-        tokio_file.sync_all().await?;
+        sync_to_disk(tokio_file).await?;
         let status = match put_behaviour {
             PutBehaviour::Overwrite => {
                 tempfile.persist(&p)?;
