@@ -6,9 +6,13 @@ oncall("scm_server_infra")
 rust_library(
     name = "cmdlib_caching",
     srcs = glob(["src/**/*.rs"]),
-    test_deps = ["//eden/mononoke/common/mononoke_macros:mononoke_macros"],
+    test_deps = [
+        "//common/rust/shed/fbinit:fbinit-tokio",
+        "//eden/mononoke/common/mononoke_macros:mononoke_macros",
+    ],
     deps = [
         "fbsource//third-party/rust:clap",
+        "fbsource//third-party/rust:tracing",
         "//common/rust/shed/fbinit:fbinit",
         "//eden/mononoke/cmdlib:arg_extensions",
         "//eden/mononoke/cmdlib:environment",
