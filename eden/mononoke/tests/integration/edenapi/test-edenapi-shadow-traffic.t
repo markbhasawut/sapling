@@ -107,9 +107,9 @@ Configure shadow traffic to forward 100% of requests to the shadow server
   $ force_update_configerator
 
 Send GET requests to prod — they should succeed and also forward to shadow
-  $ sslcurl -s "https://localhost:$MONONOKE_SOCKET/edenapi/repos"
+  $ sslcurlas client0 -s "https://localhost:$MONONOKE_SOCKET/edenapi/repos"
   {"repos":["repo"]} (no-eol)
-  $ sslcurl -s "https://localhost:$MONONOKE_SOCKET/edenapi/repos"
+  $ sslcurlas client0 -s "https://localhost:$MONONOKE_SOCKET/edenapi/repos"
   {"repos":["repo"]} (no-eol)
 
 Give the async fire-and-forget forwarding time to complete
@@ -147,7 +147,7 @@ Now disable shadow traffic
   $ sleep 1
 
 Send request with shadow disabled — prod should work but shadow should NOT get new requests
-  $ sslcurl -s "https://localhost:$MONONOKE_SOCKET/edenapi/repos"
+  $ sslcurlas client0 -s "https://localhost:$MONONOKE_SOCKET/edenapi/repos"
   {"repos":["repo"]} (no-eol)
   $ sleep 2
 
@@ -172,7 +172,7 @@ Test shadow-first mode
   $ sleep 1
 
 Shadow-first: request should succeed with response body relayed from shadow
-  $ sslcurl -s "https://localhost:$MONONOKE_SOCKET/edenapi/repos"
+  $ sslcurlas client0 -s "https://localhost:$MONONOKE_SOCKET/edenapi/repos"
   {"repos":["repo"]} (no-eol)
   $ sleep 1
 
@@ -197,7 +197,7 @@ Test shadow-first with unreachable target — should fall back to local processi
   $ sleep 1
 
 Should still get a response via local fallback
-  $ sslcurl -s "https://localhost:$MONONOKE_SOCKET/edenapi/repos"
+  $ sslcurlas client0 -s "https://localhost:$MONONOKE_SOCKET/edenapi/repos"
   {"repos":["repo"]} (no-eol)
   $ sleep 2
 

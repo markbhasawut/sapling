@@ -80,14 +80,37 @@ push:
   [255]
 
 An identity with read but not write access (client2) still moves master_bookmark
-over wireproto -- the bare-push ACL gap. The wireproto repo-write check is
-downgraded to log-only, so the move is allowed (whereas the EdenApi path denies
-it at the write):
+over wireproto in Meta's build -- the bare-push ACL gap. The wireproto
+repo-write check is downgraded to log-only there, so the move is allowed
+(whereas the EdenApi path denies it at the write). Open-source builds enforce
+the check, so the move is denied:
   $ echo foo3 > foo && hg ci -qm foo3
+#if bucktest
   $ hg push --config auth.mononoke.cert="$TEST_CERTDIR/client2.crt" --config auth.mononoke.key="$TEST_CERTDIR/client2.key"
   pushing to mono:repo
   searching for changes
   updating bookmark master_bookmark
+#else
+  $ hg push --config auth.mononoke.cert="$TEST_CERTDIR/client2.crt" --config auth.mononoke.key="$TEST_CERTDIR/client2.key"
+  pushing to mono:repo
+  searching for changes
+  remote: Command failed
+  remote:   Error:
+  remote:     While doing a push
+  remote: 
+  remote:     Caused by:
+  remote:         0: Failed to fast-forward bookmark (set pushvar NON_FAST_FORWARD=true for a non-fast-forward move)
+  remote:         1: Repo write access for UpdateBookmark(Publishing) in repo 'repo' is not permitted with Identity for [X509_SUBJECT_NAME:CN=client2,O=Mononoke,C=US,ST=CA]
+  abort: unexpected EOL, expected netstring digit
+  [255]
+The denied push had already uploaded foo3, so client0 only moves the bookmark:
+  $ hg push
+  pushing to mono:repo
+  searching for changes
+  no changes found
+  updating bookmark master_bookmark
+  [1]
+#endif
 
 With remotenames.forceto, a push without a destination bookmark is an error,
 both bare and with -r. The hint points to --to, and to commit cloud for

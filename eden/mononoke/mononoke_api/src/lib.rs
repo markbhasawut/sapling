@@ -18,7 +18,9 @@ pub use bookmarks::BookmarkKey;
 use maplit::hashmap;
 use mononoke_repos::MononokeRepos;
 pub use mononoke_types::RepositoryId;
+use repo_authorization::AuthorizationContext;
 use repo_identity::RepoIdentityRef;
+use repo_permission_checker::RepoPermissionCheckerRef;
 use tracing::Instrument;
 
 use crate::repo::RepoContextBuilder;
@@ -187,6 +189,25 @@ impl<R: RepoIdentityRef> Mononoke<R> {
         self.repos
             .get_by_name(name.as_ref())
             .map(|repo| repo.repo_identity().id())
+    }
+}
+
+impl<R: RepoIdentityRef + RepoPermissionCheckerRef> Mononoke<R> {
+    /// The names of the repos whose metadata `ctx` may read, which are the
+    /// ones a repo listing may show it.
+    pub async fn readable_repo_names(&self, ctx: &CoreContext) -> Vec<String> {
+        let authz = AuthorizationContext::new(ctx);
+        let mut names = Vec::new();
+        for repo in self.repos() {
+            if authz
+                .check_repo_metadata_read(ctx, repo.as_ref())
+                .await
+                .is_permitted()
+            {
+                names.push(repo.repo_identity().name().to_string());
+            }
+        }
+        names
     }
 }
 

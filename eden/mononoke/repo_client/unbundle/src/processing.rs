@@ -549,6 +549,18 @@ async fn force_pushrebase(
     Ok((new_target, log_id))
 }
 
+/// Whether a push's bookmark movements only log failed ACL checks instead of
+/// enforcing them. Meta's build logs them for every identity that is not
+/// known to be read-only or draft-only. Open-source builds enforce them: a
+/// plain wireproto push has nothing else that checks the repo write ACL.
+fn only_log_acl_checks(authz: &AuthorizationContext) -> bool {
+    cfg!(fbcode_build)
+        && !matches!(
+            authz,
+            AuthorizationContext::ReadOnlyIdentity | AuthorizationContext::DraftOnlyIdentity,
+        )
+}
+
 async fn plain_push_bookmark(
     ctx: &CoreContext,
     repo: &impl Repo,
@@ -562,10 +574,7 @@ async fn plain_push_bookmark(
     cross_repo_push_source: CrossRepoPushSource,
 ) -> Result<Option<BookmarkUpdateLogId>, BundleResolverError> {
     let authz = AuthorizationContext::new(ctx);
-    let only_log_acl_checks = !matches!(
-        authz,
-        AuthorizationContext::ReadOnlyIdentity | AuthorizationContext::DraftOnlyIdentity,
-    );
+    let only_log_acl_checks = only_log_acl_checks(&authz);
     let log_id = match (bookmark_push.old, bookmark_push.new) {
         (None, Some(new_target)) => {
             let res = bookmarks_movement::CreateBookmarkOp::new(
@@ -670,10 +679,7 @@ async fn infinitepush_scratch_bookmark(
     cross_repo_push_source: CrossRepoPushSource,
 ) -> Result<()> {
     let authz = AuthorizationContext::new(ctx);
-    let only_log_acl_checks = !matches!(
-        authz,
-        AuthorizationContext::ReadOnlyIdentity | AuthorizationContext::DraftOnlyIdentity,
-    );
+    let only_log_acl_checks = only_log_acl_checks(&authz);
     if bookmark_push.old.is_none() && bookmark_push.create {
         bookmarks_movement::CreateBookmarkOp::new(
             bookmark_push.name.clone(),
