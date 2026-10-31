@@ -52,9 +52,15 @@ use permission_checker::InternalAclProvider;
 use rendezvous::RendezVousArgs;
 use repo_derivation_queues::DerivationQueueArgs;
 use sql_ext::facebook::MysqlOptions;
+#[cfg(not(fbcode_build))]
+use sql_ext::facebook::OssFailoverSettings;
 use sql_ext::facebook::PoolConfig;
+#[cfg(not(fbcode_build))]
+use sql_ext::facebook::PrimaryCheck;
 use sql_ext::facebook::ReadConnectionType;
 use sql_ext::facebook::SharedConnectionPool;
+#[cfg(not(fbcode_build))]
+use sql_ext::facebook::set_oss_transaction_time_limit;
 use tokio::runtime::Handle;
 use tokio::runtime::Runtime;
 
@@ -394,7 +400,10 @@ impl MononokeAppBuilder {
         let caching = init_cachelib(self.fb, &self.cachelib_settings, &cachelib_args);
 
         let mysql_options =
-            create_mysql_options(&mysql_args, create_mysql_pool_config(&mysql_args));
+            create_mysql_options(&mysql_args, create_mysql_pool_config(&mysql_args))?;
+        // Statements in transactions get the same time limit as the others.
+        #[cfg(not(fbcode_build))]
+        set_oss_transaction_time_limit(Duration::from_millis(mysql_args.mysql_query_time_limit));
 
         let blobstore_options = create_blobstore_options(
             &blobstore_args,
@@ -496,18 +505,21 @@ fn create_runtime(runtime_args: &RuntimeArgs) -> Result<Runtime> {
     Ok(runtime)
 }
 
-fn create_mysql_options(mysql_args: &MysqlArgs, pool_config: PoolConfig) -> MysqlOptions {
+fn create_mysql_options(mysql_args: &MysqlArgs, pool_config: PoolConfig) -> Result<MysqlOptions> {
+    #[cfg(fbcode_build)]
     let pool = SharedConnectionPool::new();
+    #[cfg(not(fbcode_build))]
+    let pool = SharedConnectionPool::with_settings(create_oss_failover_settings(mysql_args)?);
     let read_connection_type = if mysql_args.mysql_master_only {
         ReadConnectionType::Master
     } else {
         ReadConnectionType::ReplicaOnly
     };
-    MysqlOptions {
+    Ok(MysqlOptions {
         pool,
         pool_config,
         read_connection_type,
-    }
+    })
 }
 
 fn create_mysql_pool_config(mysql_args: &MysqlArgs) -> PoolConfig {
@@ -532,6 +544,31 @@ fn create_mysql_sqlblob_pool_config(mysql_args: &MysqlArgs) -> PoolConfig {
         mysql_args.mysql_conn_open_timeout,
         Duration::from_millis(mysql_args.mysql_query_time_limit),
     )
+}
+
+#[cfg(not(fbcode_build))]
+fn create_oss_failover_settings(mysql_args: &MysqlArgs) -> Result<OssFailoverSettings> {
+    let settings = OssFailoverSettings {
+        probe_interval: Duration::from_millis(mysql_args.oss_mysql_probe_interval_ms),
+        primary_check: mysql_args.oss_mysql_primary_check,
+        secrets_dir: mysql_args.oss_mysql_secrets_dir.clone(),
+        checkout_timeout: Duration::from_millis(mysql_args.oss_mysql_checkout_timeout_ms),
+    };
+    // With neither, a checkout stuck on a primary that stopped answering
+    // never ends, and nothing starts the probe round that would move it.
+    if settings.primary_check != PrimaryCheck::None
+        && settings.probe_interval.is_zero()
+        && settings.checkout_timeout.is_zero()
+    {
+        anyhow::bail!(
+            "--oss-mysql-probe-interval-ms 0 and --oss-mysql-checkout-timeout-ms 0 cannot be \
+             used together with --oss-mysql-primary-check {}: a connection attempt to a primary \
+             that stopped answering would then never end, and nothing would look for a new \
+             primary. Give either a nonzero value",
+            settings.primary_check
+        );
+    }
+    Ok(settings)
 }
 
 fn create_blobstore_options(
@@ -567,7 +604,7 @@ fn create_blobstore_options(
     let blobstore_put_behaviour = blobstore_args.blobstore_put_behaviour;
 
     let mysql_sqlblob_options =
-        create_mysql_options(mysql_args, create_mysql_sqlblob_pool_config(mysql_args));
+        create_mysql_options(mysql_args, create_mysql_sqlblob_pool_config(mysql_args))?;
 
     let blobstore_options = BlobstoreOptions::new(
         chaos_options,
@@ -657,4 +694,68 @@ fn create_acl_provider(
             .with_context(|| format!("Failed to load ACLs from '{}'", acl_file.to_string_lossy()));
     }
     DefaultAclProvider::new(fb).context("Failed to create DefaultAclProvider")
+}
+
+#[cfg(all(test, not(fbcode_build)))]
+mod tests {
+    use clap::Parser;
+    use mononoke_macros::mononoke;
+
+    use super::*;
+
+    #[derive(Parser)]
+    struct Cli {
+        #[clap(flatten)]
+        mysql: MysqlArgs,
+    }
+
+    fn settings(args: &[&str]) -> Result<OssFailoverSettings> {
+        let cli = Cli::try_parse_from(std::iter::once("mononoke").chain(args.iter().copied()))?;
+        create_oss_failover_settings(&cli.mysql)
+    }
+
+    #[mononoke::test]
+    fn test_oss_failover_settings() -> Result<()> {
+        let defaults = settings(&[])?;
+        assert_eq!(defaults, OssFailoverSettings::default());
+
+        // Either limit alone may be zero.
+        let settings_of =
+            |args: &[&str]| settings(args).map(|s| (s.probe_interval, s.checkout_timeout));
+        assert_eq!(
+            settings_of(&["--oss-mysql-probe-interval-ms", "0"])?,
+            (Duration::ZERO, Duration::from_secs(10))
+        );
+        assert_eq!(
+            settings_of(&["--oss-mysql-checkout-timeout-ms", "0"])?,
+            (Duration::from_secs(1), Duration::ZERO)
+        );
+
+        // Not both, unless nothing is probed.
+        let both = [
+            "--oss-mysql-probe-interval-ms",
+            "0",
+            "--oss-mysql-checkout-timeout-ms",
+            "0",
+        ];
+        for check in ["identity", "writable"] {
+            let mut args = both.to_vec();
+            args.extend(["--oss-mysql-primary-check", check]);
+            let err = settings(&args).expect_err("both are zero");
+            assert!(
+                err.to_string().contains(&format!(
+                    "--oss-mysql-probe-interval-ms 0 and --oss-mysql-checkout-timeout-ms 0 \
+                     cannot be used together with --oss-mysql-primary-check {check}"
+                )),
+                "{err:#}"
+            );
+        }
+        assert!(settings(&both).is_err());
+        let mut none = both.to_vec();
+        none.extend(["--oss-mysql-primary-check", "none"]);
+        let none = settings(&none)?;
+        assert_eq!(none.primary_check, PrimaryCheck::None);
+        assert_eq!(none.probe_interval, Duration::ZERO);
+        Ok(())
+    }
 }

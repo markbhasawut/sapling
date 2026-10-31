@@ -34,6 +34,7 @@ use crate::TelemetryGranularity;
 use crate::telemetry::log_consistent_read_query_error;
 use crate::telemetry::log_query_error;
 
+#[cfg(fbcode_build)]
 const RETRY_ATTEMPTS: usize = 2;
 
 // This wraps around rust/shed/sql::queries, check that macro: https://fburl.com/code/semq9xm3
@@ -193,16 +194,7 @@ macro_rules! mononoke_queries {
                     }
                     _tl::InnerSqlConnection::OssMysql(conn) => {
                         let query = _build_mysql_query($( $pname, )* $tlname)?;
-                        let mut con = _tl::OssConnection::get_conn_counted(
-                            conn.pool.clone(), &conn.stats,
-                        ).await?;
-                        let (mut res, _tel) = conn.read_query(&mut con, &query).await
-                            .map_err(_tl::anyhow::Error::from)?;
-                        let result = res
-                            .map(|row| _row_to_tuple(row))
-                            .await?
-                            .into_iter()
-                            .collect::<std::result::Result<Vec<($( $rtype, )*)>, _tl::anyhow::Error>>()?;
+                        let result = conn.read_rows(&query, _row_to_tuple).await?;
                         Ok((result, None))
                     }
                     _tl::InnerSqlConnection::Sqlite(multithread_con) => {
@@ -1187,8 +1179,10 @@ pub fn should_retry_mysql_query(err: &anyhow::Error) -> bool {
 }
 
 #[cfg(not(fbcode_build))]
-pub fn should_retry_mysql_query(_err: &anyhow::Error) -> bool {
-    false
+/// Whether to run again a closure, usually a whole transaction, that failed
+/// with `err`: see `oss_mysql::retry::should_retry_transaction`.
+pub fn should_retry_mysql_query(err: &anyhow::Error) -> bool {
+    crate::oss_mysql::retry::should_retry_transaction(err)
 }
 
 type Key = u128;
@@ -1293,6 +1287,36 @@ where
     if justknobs::eval("scm/mononoke:sql_disable_auto_retries", None, None) {
         return Ok((do_query(0).await?, 0));
     }
+    // A statement runs again only if it had no effect, or if it reads.
+    #[cfg(not(fbcode_build))]
+    let (res, attempt) =
+        crate::oss_mysql::retry::run_autocommit(do_query, |attempt, e, will_retry| {
+            // The server log explains a failure that is not retried, and
+            // whether the statement may have taken effect.
+            if !will_retry
+                && let Some(outcome) = crate::oss_mysql::retry::unretried_outcome(
+                    e,
+                    crate::oss_mysql::classify::ErrorScope::Query,
+                )
+            {
+                tracing::warn!(
+                    "MySQL query {query_name} on {shard_name} failed in attempt {attempt}, \
+                     and is not run again ({outcome}): {e:#}"
+                );
+            }
+            log_query_error(
+                sql_query_tel,
+                e,
+                granularity,
+                repo_ids,
+                query_name,
+                shard_name,
+                attempt,
+                will_retry,
+            )
+        })
+        .await?;
+    #[cfg(fbcode_build)]
     let (res, attempt) = retry(do_query, Duration::from_secs(10))
         .exponential_backoff(1.2)
         .jitter(Duration::from_secs(5))

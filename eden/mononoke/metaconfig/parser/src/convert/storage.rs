@@ -5,6 +5,8 @@
  * GNU General Public License version 2.
  */
 
+use std::collections::HashSet;
+use std::net::Ipv6Addr;
 use std::num::NonZeroU64;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -25,6 +27,7 @@ use metaconfig_types::LocalDatabaseConfig;
 use metaconfig_types::MetadataDatabaseConfig;
 use metaconfig_types::MultiplexId;
 use metaconfig_types::MultiplexedStoreType;
+use metaconfig_types::OssDbEndpoint;
 use metaconfig_types::OssRemoteDatabaseConfig;
 use metaconfig_types::OssRemoteMetadataDatabaseConfig;
 use metaconfig_types::PackConfig;
@@ -262,14 +265,130 @@ impl Convert for RawOssDbRemote {
     type Output = OssRemoteDatabaseConfig;
 
     fn convert(self) -> Result<Self::Output> {
+        // The legacy port is also the default port of `hosts` and hosts file
+        // entries, so it must be valid even when `hosts` is set.
+        let default_port = match u16::try_from(self.port) {
+            Ok(port) if port > 0 => port,
+            _ => bail!(
+                "OSS database port {} is out of range 1..=32767 (it is also the default port \
+                 of hosts and hosts_file entries)",
+                self.port
+            ),
+        };
+        let endpoints = match &self.hosts {
+            Some(hosts) => parse_oss_db_hosts(hosts, default_port)?,
+            None => {
+                if self.host.is_empty() {
+                    bail!("OSS database needs a host or a non-empty hosts list");
+                }
+                vec![OssDbEndpoint {
+                    host: self.host.clone(),
+                    port: default_port,
+                }]
+            }
+        };
+        let hosts_file = match self.hosts_file {
+            Some(path) => {
+                let path = PathBuf::from(path);
+                if !path.is_absolute() {
+                    bail!(
+                        "OSS database hosts_file '{}' must be an absolute path",
+                        path.display()
+                    );
+                }
+                Some(path)
+            }
+            None => None,
+        };
         Ok(OssRemoteDatabaseConfig {
             host: self.host,
             port: self.port,
             database: self.database,
             user_secret: self.user_secret,
             password_secret: self.password_secret,
+            endpoints,
+            hosts_file,
         })
     }
+}
+
+/// Parse the `hosts` list of an OSS database: it must be non-empty and
+/// contain no duplicates.
+///
+/// sql_ext parses hosts files with the same grammar in
+/// `oss_mysql::endpoint`; keep the two in sync.
+fn parse_oss_db_hosts(hosts: &[String], default_port: u16) -> Result<Vec<OssDbEndpoint>> {
+    if hosts.is_empty() {
+        bail!("OSS database hosts list must not be empty");
+    }
+    let mut seen = HashSet::new();
+    let mut endpoints = Vec::with_capacity(hosts.len());
+    for entry in hosts {
+        let endpoint = parse_oss_db_endpoint(entry, default_port)
+            .with_context(|| format!("Invalid OSS database hosts entry '{entry}'"))?;
+        if !seen.insert((endpoint.host.to_ascii_lowercase(), endpoint.port)) {
+            bail!("Duplicate OSS database hosts entry '{entry}' ({endpoint})");
+        }
+        endpoints.push(endpoint);
+    }
+    Ok(endpoints)
+}
+
+/// Parse one candidate server: "host", "host:port", "[v6]" or "[v6]:port".
+/// The port defaults to `default_port`.
+fn parse_oss_db_endpoint(entry: &str, default_port: u16) -> Result<OssDbEndpoint> {
+    let entry = entry.trim();
+    let (host, port) = if let Some(rest) = entry.strip_prefix('[') {
+        let (addr, after) = rest
+            .split_once(']')
+            .ok_or_else(|| anyhow!("missing ']' after IPv6 address"))?;
+        if addr.parse::<Ipv6Addr>().is_err() {
+            bail!("'{addr}' is not an IPv6 address");
+        }
+        let port = match after {
+            "" => None,
+            _ => Some(
+                after
+                    .strip_prefix(':')
+                    .ok_or_else(|| anyhow!("expected ':port' after ']'"))?,
+            ),
+        };
+        (addr, port)
+    } else {
+        if entry.parse::<Ipv6Addr>().is_ok() {
+            bail!("IPv6 addresses must be in brackets, as in [{entry}]:3306");
+        }
+        let (host, port) = match entry.split_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (entry, None),
+        };
+        if host.is_empty() {
+            bail!("empty host");
+        }
+        if !host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_'))
+        {
+            bail!("'{host}' is not a valid host name or IPv4 address");
+        }
+        (host, port)
+    };
+    let port = match port {
+        None => default_port,
+        Some(port) => {
+            if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+                bail!("'{port}' is not a valid port");
+            }
+            match port.parse::<u16>() {
+                Ok(port) if port > 0 => port,
+                _ => bail!("port {port} is out of range 1..=65535"),
+            }
+        }
+    };
+    Ok(OssDbEndpoint {
+        host: host.to_string(),
+        port,
+    })
 }
 
 impl Convert for RawDbShardedRemote {
@@ -413,5 +532,310 @@ impl Convert for RawMultiplexedStoreType {
                 Err(anyhow!("unknown store type {field}"))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use mononoke_macros::mononoke;
+
+    use super::*;
+
+    fn raw_oss_db(
+        host: &str,
+        port: i16,
+        hosts: Option<&[&str]>,
+        hosts_file: Option<&str>,
+    ) -> RawOssDbRemote {
+        RawOssDbRemote {
+            host: host.to_string(),
+            port,
+            database: "mononoke".to_string(),
+            password_secret: "file:/etc/mononoke/mysql.pw".to_string(),
+            user_secret: "literal:mononoke".to_string(),
+            hosts: hosts.map(|hosts| hosts.iter().map(|h| h.to_string()).collect()),
+            hosts_file: hosts_file.map(String::from),
+        }
+    }
+
+    fn endpoint(host: &str, port: u16) -> OssDbEndpoint {
+        OssDbEndpoint {
+            host: host.to_string(),
+            port,
+        }
+    }
+
+    /// Converts a config whose legacy port is `default_port` and returns
+    /// the endpoints parsed from `hosts`.
+    fn convert_hosts(hosts: &[&str], default_port: i16) -> Result<Vec<OssDbEndpoint>> {
+        Ok(raw_oss_db("legacy", default_port, Some(hosts), None)
+            .convert()?
+            .endpoints)
+    }
+
+    fn convert_error(raw: RawOssDbRemote) -> String {
+        format!("{:#}", raw.convert().expect_err("conversion should fail"))
+    }
+
+    fn hosts_error(entry: &str) -> String {
+        convert_error(raw_oss_db("legacy", 3306, Some(&[entry]), None))
+    }
+
+    #[mononoke::test]
+    fn test_oss_db_legacy_host_port() {
+        let config = raw_oss_db("127.0.0.1", 13306, None, None)
+            .convert()
+            .unwrap();
+        assert_eq!(config.endpoints, vec![endpoint("127.0.0.1", 13306)]);
+        assert_eq!(config.host, "127.0.0.1");
+        assert_eq!(config.port, 13306);
+        assert_eq!(config.database, "mononoke");
+        assert_eq!(config.user_secret, "literal:mononoke");
+        assert_eq!(config.password_secret, "file:/etc/mononoke/mysql.pw");
+        assert_eq!(config.hosts_file, None);
+
+        let config = raw_oss_db("db1", 32767, None, None).convert().unwrap();
+        assert_eq!(config.endpoints, vec![endpoint("db1", 32767)]);
+    }
+
+    #[mononoke::test]
+    fn test_oss_db_legacy_host_required_without_hosts() {
+        let err = convert_error(raw_oss_db("", 3306, None, None));
+        assert!(err.contains("needs a host"), "{err}");
+    }
+
+    #[mononoke::test]
+    fn test_oss_db_legacy_port_bounds() {
+        for port in [-1, -32768, 0] {
+            let err = convert_error(raw_oss_db("db1", port, None, None));
+            assert!(err.contains("out of range 1..=32767"), "{port}: {err}");
+            // The legacy port is validated even when `hosts` has explicit
+            // ports, since it is the default for hosts file entries.
+            let err = convert_error(raw_oss_db("db1", port, Some(&["db2:3306"]), None));
+            assert!(err.contains("out of range 1..=32767"), "{port}: {err}");
+        }
+    }
+
+    #[mononoke::test]
+    fn test_oss_db_hosts_forms() -> Result<()> {
+        assert_eq!(
+            convert_hosts(
+                &[
+                    "db1",
+                    "db2:3307",
+                    " db-3.example.com:13306 ",
+                    "10.0.0.1",
+                    "10.0.0.2:65535",
+                    "my_db:1",
+                ],
+                3306,
+            )?,
+            vec![
+                endpoint("db1", 3306),
+                endpoint("db2", 3307),
+                endpoint("db-3.example.com", 13306),
+                endpoint("10.0.0.1", 3306),
+                endpoint("10.0.0.2", 65535),
+                endpoint("my_db", 1),
+            ]
+        );
+        Ok(())
+    }
+
+    #[mononoke::test]
+    fn test_oss_db_hosts_take_precedence_over_legacy() -> Result<()> {
+        let config =
+            raw_oss_db("legacy", 3306, Some(&["db1:13306", "db2:13307"]), None).convert()?;
+        assert_eq!(
+            config.endpoints,
+            vec![endpoint("db1", 13306), endpoint("db2", 13307)]
+        );
+        // The legacy fields are kept as they were.
+        assert_eq!(config.host, "legacy");
+        assert_eq!(config.port, 3306);
+
+        // With `hosts`, the legacy host may be empty.
+        let config = raw_oss_db("", 3306, Some(&["db1"]), None).convert()?;
+        assert_eq!(config.endpoints, vec![endpoint("db1", 3306)]);
+        Ok(())
+    }
+
+    #[mononoke::test]
+    fn test_oss_db_hosts_ipv6() -> Result<()> {
+        assert_eq!(
+            convert_hosts(&["[::1]:13307", "[fe80::1]", "[2001:db8::2]:3306"], 13306)?,
+            vec![
+                endpoint("::1", 13307),
+                endpoint("fe80::1", 13306),
+                endpoint("2001:db8::2", 3306),
+            ]
+        );
+
+        let err = hosts_error("::1");
+        assert!(
+            err.contains("must be in brackets, as in [::1]:3306"),
+            "{err}"
+        );
+        let err = hosts_error("fe80::1:3306");
+        assert!(err.contains("must be in brackets"), "{err}");
+        let err = hosts_error("[::1");
+        assert!(err.contains("missing ']'"), "{err}");
+        let err = hosts_error("[::1]3306");
+        assert!(err.contains("expected ':port'"), "{err}");
+        let err = hosts_error("[db1]:3306");
+        assert!(err.contains("not an IPv6 address"), "{err}");
+        let err = hosts_error("[]:3306");
+        assert!(err.contains("not an IPv6 address"), "{err}");
+        Ok(())
+    }
+
+    #[mononoke::test]
+    fn test_oss_db_hosts_port_bounds() -> Result<()> {
+        assert_eq!(
+            convert_hosts(&["db1:1", "db2:65535", "db3:003306"], 3306)?,
+            vec![
+                endpoint("db1", 1),
+                endpoint("db2", 65535),
+                endpoint("db3", 3306),
+            ]
+        );
+        for entry in [
+            "db1:0",
+            "db1:65536",
+            "db1:99999999999",
+            "[::1]:0",
+            "[::1]:70000",
+        ] {
+            let err = hosts_error(entry);
+            assert!(err.contains("out of range 1..=65535"), "{entry}: {err}");
+            assert!(err.contains(&format!("'{entry}'")), "{entry}: {err}");
+        }
+        for entry in [
+            "db1:",
+            "db1:+3306",
+            "db1:-1",
+            "db1:abc",
+            "db1: 3306",
+            "[::1]:",
+        ] {
+            let err = hosts_error(entry);
+            assert!(err.contains("is not a valid port"), "{entry}: {err}");
+        }
+        Ok(())
+    }
+
+    #[mononoke::test]
+    fn test_oss_db_hosts_invalid_hosts() {
+        for entry in ["", "  ", ":3306", "db 1:3306", "db1/x", "db1,db2", "a:1:2"] {
+            let err = hosts_error(entry);
+            assert!(
+                err.contains("Invalid OSS database hosts entry"),
+                "{entry}: {err}"
+            );
+        }
+        let err = hosts_error("db1,db2:3306");
+        assert!(err.contains("not a valid host name"), "{err}");
+        let err = hosts_error("db1:3306,db2:3306");
+        assert!(err.contains("is not a valid port"), "{err}");
+    }
+
+    #[mononoke::test]
+    fn test_oss_db_hosts_empty_and_duplicates() {
+        let err = convert_error(raw_oss_db("db1", 3306, Some(&[]), None));
+        assert!(err.contains("must not be empty"), "{err}");
+
+        // Duplicates are detected after the default port is applied, and
+        // host names are compared case-insensitively.
+        for hosts in [
+            &["db1:3306", "db2:3306", "db1:3306"][..],
+            &["db1", "db1:3306"],
+            &["DB1:3306", "db1"],
+        ] {
+            let err = convert_error(raw_oss_db("legacy", 3306, Some(hosts), None));
+            assert!(err.contains("Duplicate OSS database hosts entry"), "{err}");
+        }
+        let err = convert_error(raw_oss_db(
+            "legacy",
+            3306,
+            Some(&["[::1]", "[::1]:3306"]),
+            None,
+        ));
+        assert!(err.contains("([::1]:3306)"), "{err}");
+
+        // The same host on different ports is not a duplicate.
+        assert_eq!(
+            convert_hosts(&["db1:3306", "db1:3307"], 3306).unwrap(),
+            vec![endpoint("db1", 3306), endpoint("db1", 3307)]
+        );
+    }
+
+    #[mononoke::test]
+    fn test_oss_db_hosts_file() -> Result<()> {
+        let config = raw_oss_db(
+            "db1",
+            3306,
+            Some(&["db1", "db2"]),
+            Some("/etc/mononoke/mysql-hosts"),
+        )
+        .convert()?;
+        assert_eq!(
+            config.hosts_file,
+            Some(PathBuf::from("/etc/mononoke/mysql-hosts"))
+        );
+        // The file is not read while parsing: `endpoints` stays the
+        // fallback.
+        assert_eq!(
+            config.endpoints,
+            vec![endpoint("db1", 3306), endpoint("db2", 3306)]
+        );
+
+        let config = raw_oss_db("db1", 3306, None, Some("/nonexistent/hosts")).convert()?;
+        assert_eq!(config.hosts_file, Some(PathBuf::from("/nonexistent/hosts")));
+        assert_eq!(config.endpoints, vec![endpoint("db1", 3306)]);
+
+        for path in ["", "mysql-hosts", "./mysql-hosts"] {
+            let err = convert_error(raw_oss_db("db1", 3306, None, Some(path)));
+            assert!(err.contains("must be an absolute path"), "{path}: {err}");
+        }
+        Ok(())
+    }
+
+    #[mononoke::test]
+    fn test_oss_db_toml_keys() -> Result<()> {
+        let raw: RawOssDbRemote = toml::from_str(
+            r#"
+            host = "127.0.0.1"
+            port = 13306
+            database = "mononoke"
+            user_secret = "literal:mononoke"
+            password_secret = "file:/etc/mononoke/mysql.pw"
+            hosts = ["127.0.0.1:13306", "127.0.0.1:13307"]
+            hosts_file = "/etc/mononoke/mysql-hosts"
+            "#,
+        )?;
+        let config = raw.convert()?;
+        assert_eq!(
+            config.endpoints,
+            vec![endpoint("127.0.0.1", 13306), endpoint("127.0.0.1", 13307)]
+        );
+        assert_eq!(
+            config.hosts_file,
+            Some(PathBuf::from("/etc/mononoke/mysql-hosts"))
+        );
+
+        // A config written for older binaries has neither key.
+        let raw: RawOssDbRemote = toml::from_str(
+            r#"
+            host = "127.0.0.1"
+            port = 13306
+            database = "mononoke"
+            user_secret = "literal:mononoke"
+            password_secret = "file:/etc/mononoke/mysql.pw"
+            "#,
+        )?;
+        assert_eq!(raw.hosts, None);
+        assert_eq!(raw.hosts_file, None);
+        assert_eq!(raw.convert()?.endpoints, vec![endpoint("127.0.0.1", 13306)]);
+        Ok(())
     }
 }

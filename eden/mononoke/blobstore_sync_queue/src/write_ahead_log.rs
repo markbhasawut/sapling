@@ -479,6 +479,15 @@ impl SqlShardedConstruct for SqlBlobstoreWalBuilder {
                 // See https://fb.workplace.com/groups/mysql.users/posts/24130604319894856
                 conn.set_isolation_level(Some(IsolationLevel::ReadCommitted));
             }
+            // OSS MySQL applies it to transactions only: autocommit
+            // statements keep the server's default.
+            if let Connection {
+                inner: SqlConnection::OssMysql(conn),
+                ..
+            } = conn
+            {
+                conn.set_isolation_level(Some(IsolationLevel::ReadCommitted));
+            }
         }
         let write_connections = Arc::new(write_connections);
 
