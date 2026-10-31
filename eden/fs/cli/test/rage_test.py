@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 from typing import BinaryIO
 
-from eden.fs.cli.rage import IOWithRedaction, print_log_file
+from eden.fs.cli.rage import IOWithRedaction, paste_output, print_log_file
 
 
 class LogRedactionTest(unittest.TestCase):
@@ -51,3 +51,39 @@ class LogRedactionTest(unittest.TestCase):
         written = sink.getvalue().decode()
         self.assertNotIn(token, written)
         self.assertIn("<ACCESS_TOKEN_REDACTED>", written)
+
+
+class PasteOutputTest(unittest.TestCase):
+    def paste(self, processor: str, text: str) -> tuple[int, str]:
+        sink = io.BytesIO()
+        result = paste_output(
+            lambda out: out.write(text), processor, IOWithRedaction(sink), False
+        )
+        return result, sink.getvalue().decode()
+
+    def test_without_reporter_the_section_is_inline(self) -> None:
+        token = "ghp_" + (string.digits + string.ascii_lowercase)[:36]
+        result, written = self.paste("", f"section body {token}\n")
+        self.assertEqual(result, 0)
+        self.assertEqual(written, "section body <ACCESS_TOKEN_REDACTED>\n")
+
+    def test_without_reporter_a_failing_section_is_reported(self) -> None:
+        def fail(out: IOWithRedaction) -> None:
+            raise RuntimeError("no such command")
+
+        sink = io.BytesIO()
+        result = paste_output(fail, "", IOWithRedaction(sink), False)
+        self.assertEqual(result, 1)
+        self.assertEqual(
+            sink.getvalue().decode(), "Error generating output: no such command\n"
+        )
+
+    def test_reporter_output_names_the_paste(self) -> None:
+        reporter = (
+            "sh -c 'cat > /dev/null; "
+            'printf "uploaded\\nP123: https://paste/P123\\n"\''
+        )
+        result, written = self.paste(reporter, "section body\n")
+        self.assertEqual(result, 0)
+        self.assertEqual(written, "P123")
+
