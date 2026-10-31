@@ -11,6 +11,8 @@ mod hasher;
 mod mononoke_queries;
 #[cfg(not(fbcode_build))]
 mod oss;
+#[cfg(not(fbcode_build))]
+mod oss_mysql;
 pub mod replication;
 
 mod sqlite;
@@ -18,6 +20,7 @@ mod telemetry;
 #[cfg(test)]
 mod tests;
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -43,6 +46,35 @@ use crate::telemetry::TelemetryGranularity;
 use crate::telemetry::TransactionTelemetry;
 use crate::telemetry::log_query_telemetry;
 use crate::telemetry::log_transaction_telemetry;
+
+/// Runs `do_transaction`, which runs a whole transaction and gets the
+/// attempt number, counted from 1.
+///
+/// OSS builds run it again while its failure says that nothing was committed
+/// and that a later attempt may succeed (see [`should_retry_query`]), as
+/// when the MySQL primary is demoted while the transaction is open: up to 4
+/// attempts in all, 1, 2 and 4 seconds apart, plus jitter. A failure that
+/// is not retried any more is logged with whether it may have been
+/// committed. fbcode builds run it once. `name` names the transaction in
+/// logs.
+pub async fn retry_transaction<T, Fut>(
+    name: &str,
+    do_transaction: impl FnMut(usize) -> Fut,
+) -> Result<T>
+where
+    Fut: Future<Output = Result<T>>,
+{
+    #[cfg(not(fbcode_build))]
+    {
+        crate::oss_mysql::retry::run_transaction(name, do_transaction).await
+    }
+    #[cfg(fbcode_build)]
+    {
+        let _ = name;
+        let mut do_transaction = do_transaction;
+        do_transaction(1).await
+    }
+}
 
 #[must_use]
 pub enum TransactionResult {
@@ -227,6 +259,8 @@ pub mod facebook {
     #[cfg(not(fbcode_build))]
     pub use crate::oss::MyAdminLagMonitor;
     #[cfg(not(fbcode_build))]
+    pub use crate::oss::OssFailoverSettings;
+    #[cfg(not(fbcode_build))]
     pub use crate::oss::PoolConfig;
     #[cfg(not(fbcode_build))]
     pub use crate::oss::SharedConnectionPool;
@@ -234,6 +268,18 @@ pub mod facebook {
     pub use crate::oss::create_mysql_connections_sharded;
     #[cfg(not(fbcode_build))]
     pub use crate::oss::create_mysql_connections_unsharded;
+    #[cfg(not(fbcode_build))]
+    pub use crate::oss::set_oss_transaction_time_limit;
+    #[cfg(not(fbcode_build))]
+    pub use crate::oss_mysql::OssMysqlTarget;
+    #[cfg(not(fbcode_build))]
+    pub use crate::oss_mysql::create_oss_mysql_connections;
+    #[cfg(not(fbcode_build))]
+    pub use crate::oss_mysql::decide::PrimaryCheck;
+    #[cfg(not(fbcode_build))]
+    pub use crate::oss_mysql::endpoint::parse_oss_mysql_endpoint;
+    #[cfg(not(fbcode_build))]
+    pub use crate::oss_mysql::endpoint::parse_oss_mysql_hosts_file;
 
     /// MySQL global shared connection pool configuration.
     #[derive(Clone, Default)]

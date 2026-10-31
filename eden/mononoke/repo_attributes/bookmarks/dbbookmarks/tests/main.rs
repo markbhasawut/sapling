@@ -71,6 +71,94 @@ fn compare_log_entries(
     }
 }
 
+/// A bookmark transaction open on a MySQL primary that is demoted fails
+/// with 1290 and commits nothing. OSS builds run it again as a whole, and the
+/// move lands once.
+#[cfg(not(fbcode_build))]
+#[mononoke::fbinit_test]
+async fn test_transaction_runs_again_after_demotion(fb: FacebookInit) -> Result<()> {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
+    use bookmarks::BookmarkTransactionError;
+    use bookmarks::BookmarkTransactionHook;
+    use futures::FutureExt;
+    use sql::mysql::OssErrorKind;
+    use sql::mysql::OssMysqlError;
+    use sql::mysql::OssPhase;
+    use sql::mysql::OssStmt;
+    use sql::mysql_async::ServerError;
+
+    let failure = |code: u16| {
+        let err = OssMysqlError {
+            phase: OssPhase::InTransaction,
+            stmt: OssStmt::Unknown,
+            endpoint: "127.0.0.1:13306/mononoke".into(),
+            generation: 1,
+            kind: OssErrorKind::Mysql(sql::mysql_async::Error::Server(ServerError {
+                code,
+                message: format!("error {code}"),
+                state: "HY000".to_string(),
+            })),
+        };
+        BookmarkTransactionError::Other(Error::from(err.into_mysql()))
+    };
+    // A hook, which runs in the transaction, fails in the first attempts
+    // with the error of `code`.
+    let failing_hook = |code: u16, failures: usize, attempts: Arc<AtomicUsize>| {
+        let hook: BookmarkTransactionHook = Arc::new(move |_ctx, txn| {
+            let attempt = attempts.fetch_add(1, Ordering::Relaxed);
+            async move {
+                if attempt < failures {
+                    Err(failure(code))
+                } else {
+                    Ok(txn)
+                }
+            }
+            .boxed()
+        });
+        hook
+    };
+
+    let ctx = CoreContext::test_mock(fb);
+    let bookmarks = SqlBookmarksBuilder::with_sqlite_in_memory()?.with_repo_id(REPO_ZERO);
+    let name = create_bookmark_name("book");
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let mut txn = bookmarks.create_transaction(ctx.clone());
+    txn.force_set(&name, ONES_CSID, BookmarkUpdateReason::TestMove)?;
+    let log_id = txn
+        .commit_with_hooks(vec![failing_hook(1290, 1, attempts.clone())])
+        .await?;
+    assert_eq!(log_id, Some(1));
+    assert_eq!(attempts.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        bookmarks
+            .get_raw(ctx.clone(), &name, Freshness::MostRecent)
+            .await?,
+        Some((ONES_CSID, Some(1)))
+    );
+
+    // A failure that a new attempt would get again is not retried.
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let mut txn = bookmarks.create_transaction(ctx.clone());
+    txn.update(&name, TWOS_CSID, ONES_CSID, BookmarkUpdateReason::TestMove)?;
+    let err = txn
+        .commit_with_hooks(vec![failing_hook(1062, 1, attempts.clone())])
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("1062"), "{err:#}");
+    assert_eq!(attempts.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        bookmarks
+            .get_raw(ctx.clone(), &name, Freshness::MostRecent)
+            .await?,
+        Some((ONES_CSID, Some(1)))
+    );
+    Ok(())
+}
+
 #[mononoke::fbinit_test]
 async fn test_simple_unconditional_set_get(fb: FacebookInit) {
     let ctx = CoreContext::test_mock(fb);

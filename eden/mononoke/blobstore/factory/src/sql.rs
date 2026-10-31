@@ -49,6 +49,7 @@ pub enum MetadataSqlConnectionsFactory {
     },
     OssRemote {
         remote_config: OssRemoteMetadataDatabaseConfig,
+        mysql_options: MysqlOptions,
     },
 }
 
@@ -98,7 +99,10 @@ impl MetadataSqlFactory {
                 }
             }
             MetadataDatabaseConfig::OssRemote(remote_config) => {
-                MetadataSqlConnectionsFactory::OssRemote { remote_config }
+                MetadataSqlConnectionsFactory::OssRemote {
+                    remote_config,
+                    mysql_options,
+                }
             }
         };
         Ok(Self {
@@ -129,8 +133,16 @@ impl MetadataSqlFactory {
                 mysql_options,
                 self.readonly.0,
             ),
-            MetadataSqlConnectionsFactory::OssRemote { remote_config } => {
-                T::with_oss_remote_metadata_database_config(remote_config, self.readonly.0).await
+            MetadataSqlConnectionsFactory::OssRemote {
+                remote_config,
+                mysql_options,
+            } => {
+                T::with_oss_remote_metadata_database_config(
+                    remote_config,
+                    mysql_options,
+                    self.readonly.0,
+                )
+                .await
             }
         }
     }
@@ -168,8 +180,16 @@ impl MetadataSqlFactory {
                 })
                 .await?
             }
-            MetadataSqlConnectionsFactory::OssRemote { remote_config } => {
-                T::with_oss_remote_metadata_database_config(remote_config, self.readonly.0).await
+            MetadataSqlConnectionsFactory::OssRemote {
+                remote_config,
+                mysql_options,
+            } => {
+                T::with_oss_remote_metadata_database_config(
+                    remote_config,
+                    mysql_options,
+                    self.readonly.0,
+                )
+                .await
             }
         }
     }
