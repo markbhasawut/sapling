@@ -31,10 +31,25 @@ use futures_retry::backoff::ExponentialBackoff;
 use futures_retry::backoff::Jitter;
 use sql_common::mysql::OssPhase;
 use sql_common::mysql::OssStmt;
+use stats::prelude::*;
+use tokio::time::Instant;
 
 use super::classify::Disposition;
 use super::classify::ErrorScope;
 use super::classify::classify;
+use super::classify::error_class;
+
+define_stats! {
+    prefix = "mononoke.sql_ext.queries";
+    statements: timeseries(Sum),
+    statement_failures: timeseries(Sum),
+    statement_retries: timeseries(Sum),
+    statement_ms: quantile_stat(Average, Count; P 50, P 95, P 99; Duration::from_secs(60)),
+    transactions: timeseries(Sum),
+    transaction_failures: timeseries(Sum),
+    transaction_retries: timeseries(Sum),
+    errors: dynamic_timeseries("errors.{}", (class: &'static str); Sum),
+}
 
 /// The wait before the first retry after a MySQL error. Each later wait
 /// doubles.
@@ -142,11 +157,12 @@ where
     Fut: Future<Output = Result<T>>,
 {
     let mut attempt = 1;
-    loop {
+    let result = loop {
         let err = match do_transaction(attempt).await {
-            Ok(value) => return Ok(value),
+            Ok(value) => break Ok(value),
             Err(err) => err,
         };
+        STATS::errors.add_value(1, (error_class(&err, ErrorScope::Transaction),));
         if attempt >= TRANSACTION_ATTEMPTS || !should_retry_transaction(&err) {
             if let Some(outcome) = unretried_outcome(&err, ErrorScope::Transaction) {
                 tracing::warn!(
@@ -154,14 +170,20 @@ where
                      again ({outcome}): {err:#}"
                 );
             }
-            return Err(err);
+            break Err(err);
         }
         tracing::info!(
             "MySQL transaction {name} failed in attempt {attempt}, and runs again: {err:#}"
         );
+        STATS::transaction_retries.add_value(1);
         tokio::time::sleep(retry_wait(attempt, &err)).await;
         attempt += 1;
+    };
+    STATS::transactions.add_value(1);
+    if result.is_err() {
+        STATS::transaction_failures.add_value(1);
     }
+    result
 }
 
 /// Runs an autocommit statement with `do_query`, which gets the attempt
@@ -177,20 +199,29 @@ where
     T: Send + 'static,
     Fut: Future<Output = Result<T>>,
 {
+    let start = Instant::now();
     let mut attempt = 1;
-    loop {
+    let result = loop {
         let err = match do_query(attempt).await {
-            Ok(value) => return Ok((value, attempt)),
+            Ok(value) => break Ok((value, attempt)),
             Err(err) => err,
         };
+        STATS::errors.add_value(1, (error_class(&err, ErrorScope::Query),));
         let will_retry = should_retry_autocommit(attempt, &err);
         on_error(attempt, &err, will_retry);
         if !will_retry {
-            return Err(err);
+            break Err(err);
         }
+        STATS::statement_retries.add_value(1);
         tokio::time::sleep(retry_wait(attempt, &err)).await;
         attempt += 1;
+    };
+    STATS::statements.add_value(1);
+    if result.is_err() {
+        STATS::statement_failures.add_value(1);
     }
+    STATS::statement_ms.add_value(start.elapsed().as_millis() as i64);
+    result
 }
 
 #[cfg(test)]

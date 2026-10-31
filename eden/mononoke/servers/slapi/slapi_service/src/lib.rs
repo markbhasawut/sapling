@@ -12,6 +12,8 @@ mod errors;
 pub mod handlers;
 pub mod middleware;
 mod scuba;
+#[cfg(not(fbcode_build))]
+pub mod server_health;
 pub mod utils;
 
 use std::path::Path;
@@ -43,6 +45,8 @@ use gotham_ext::middleware::TlsSessionDataMiddleware;
 use http::HeaderValue;
 use metaconfig_types::CommonConfig;
 use mononoke_api::Mononoke;
+#[cfg(not(fbcode_build))]
+use permission_checker::ArcMembershipChecker;
 use rate_limiting::RateLimitEnvironment;
 use scuba_ext::MononokeScubaSampleBuilder;
 #[cfg(fbcode_build)]
@@ -73,6 +77,7 @@ pub fn build<R: Send + Sync + Clone + 'static>(
     tls_ca_path: Option<&Path>,
     rim_backend: Option<i32>,
     rim_regional_resources: bool,
+    #[cfg(not(fbcode_build))] admin_group: ArcMembershipChecker,
 ) -> Result<SaplingRemoteApi, Error> {
     #[cfg(fbcode_build)]
     let rim = rim_backend
@@ -114,6 +119,8 @@ pub fn build<R: Send + Sync + Clone + 'static>(
     );
 
     let ctx = ServerContext::new(mononoke, will_exit);
+    #[cfg(not(fbcode_build))]
+    let ctx = ctx.with_admin_group(admin_group);
 
     let log_middleware = if test_friendly_logging {
         LogMiddleware::test_friendly()

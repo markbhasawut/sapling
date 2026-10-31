@@ -130,6 +130,7 @@ mod tests {
     use mononoke_macros::mononoke;
     use sql::OssPool;
     use sql_ext::SqlConnections;
+    use sql_ext::facebook::oss_mysql_cluster_status;
 
     use super::*;
     use crate::SqlConstructFromMetadataDatabaseConfig;
@@ -276,6 +277,22 @@ mod tests {
             Some("invalid MySQL port 0".to_string())
         );
 
+        // A store built from an entry uses the cluster of its target. Port 2,
+        // where nothing listens either, is used by no other test.
+        let config = OssRemoteDatabaseConfig {
+            port: 2,
+            endpoints: vec![OssDbEndpoint {
+                host: "127.0.0.1".to_string(),
+                port: 2,
+            }],
+            ..self::config()
+        };
+        let target = oss_mysql_target(&config)?;
+        assert_eq!(oss_mysql_cluster_status(&target), None);
+        let _store =
+            TestStore::with_oss_mysql_config(&config, &MysqlOptions::default(), false).await?;
+        let status = oss_mysql_cluster_status(&target).expect("the cluster of the store");
+        assert_eq!(status.name, "127.0.0.1:2");
         Ok(())
     }
 

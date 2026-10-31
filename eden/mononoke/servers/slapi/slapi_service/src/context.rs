@@ -12,6 +12,10 @@ use std::sync::atomic::Ordering;
 
 use gotham_derive::StateData;
 use mononoke_api::Mononoke;
+#[cfg(not(fbcode_build))]
+use permission_checker::ArcMembershipChecker;
+#[cfg(not(fbcode_build))]
+use permission_checker::MononokeIdentitySet;
 
 /// Struct containing the SaplingRemoteAPI server's global shared state.
 /// Intended to be exposed throughout the server by being inserted into
@@ -22,6 +26,9 @@ use mononoke_api::Mononoke;
 pub struct ServerContext<R: Send + Sync + 'static> {
     inner: Arc<Mutex<ServerContextInner<R>>>,
     will_exit: Arc<AtomicBool>,
+    /// Who may see the details of server health reports.
+    #[cfg(not(fbcode_build))]
+    admin_group: Option<ArcMembershipChecker>,
 }
 
 impl<R: Send + Sync + 'static> ServerContext<R> {
@@ -30,6 +37,27 @@ impl<R: Send + Sync + 'static> ServerContext<R> {
         Self {
             inner: Arc::new(Mutex::new(inner)),
             will_exit,
+            #[cfg(not(fbcode_build))]
+            admin_group: None,
+        }
+    }
+
+    /// Lets the members of `admin_group` see the details of server health
+    /// reports: see [`ServerContext::is_admin`].
+    #[cfg(not(fbcode_build))]
+    pub fn with_admin_group(self, admin_group: ArcMembershipChecker) -> Self {
+        Self {
+            admin_group: Some(admin_group),
+            ..self
+        }
+    }
+
+    /// Whether `identities` are in the admin group. False without one.
+    #[cfg(not(fbcode_build))]
+    pub async fn is_admin(&self, identities: &MononokeIdentitySet) -> bool {
+        match &self.admin_group {
+            Some(admin_group) => admin_group.is_member(identities).await,
+            None => false,
         }
     }
 

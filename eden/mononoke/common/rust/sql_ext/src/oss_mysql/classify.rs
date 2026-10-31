@@ -179,6 +179,37 @@ pub fn classify(err: &anyhow::Error, scope: ErrorScope) -> Option<ErrorClass> {
     })
 }
 
+/// What kind of failure `err` is, for the error counts of health reports:
+/// one of `no_primary`, `timeout`, `connection`, `read_only`,
+/// `too_many_connections`, `lock`, `access_denied`, `fence`, `server`,
+/// `client`, or `non_mysql` when its chain has neither an
+/// [`OssMysqlError`] nor a `mysql_async::Error`, as for SQLite. Unlike the
+/// verdict of [`classify`], the class does not depend on `scope`.
+pub fn error_class(err: &anyhow::Error, _scope: ErrorScope) -> &'static str {
+    let cause = if let Some(err) = err.chain().find_map(|e| e.downcast_ref::<OssMysqlError>()) {
+        Cause::of(&err.kind)
+    } else if let Some(err) = err.chain().find_map(|e| e.downcast_ref::<MysqlError>()) {
+        Cause::of_mysql(err)
+    } else {
+        return "non_mysql";
+    };
+    match cause {
+        Cause::Unavailable => "no_primary",
+        Cause::Timeout => "timeout",
+        Cause::Io => "connection",
+        Cause::Driver(err) if is_connection_error(err) => "connection",
+        Cause::Driver(_) | Cause::Other => "client",
+        Cause::Server(err) if is_fence_rejection(err) => "fence",
+        Cause::Server(err) if READ_ONLY.contains(&err.code) => "read_only",
+        Cause::Server(err) if OUT_OF_CONNECTIONS.contains(&err.code) => "too_many_connections",
+        Cause::Server(err) if [ER_LOCK_WAIT_TIMEOUT, ER_LOCK_DEADLOCK].contains(&err.code) => {
+            "lock"
+        }
+        Cause::Server(err) if err.code == ER_ACCESS_DENIED_ERROR => "access_denied",
+        Cause::Server(_) => "server",
+    }
+}
+
 /// Classifies an error of an OSS MySQL pool or transaction.
 pub fn classify_oss_error(err: &OssMysqlError) -> ErrorClass {
     ErrorClass {
@@ -724,5 +755,65 @@ mod tests {
         ] {
             assert!(!refuses(failure), "{failure:?}");
         }
+    }
+
+    #[mononoke::test]
+    fn test_error_class() {
+        let expected: &[(&[Failure], &str)] = &[
+            (&[Failure::Unavailable], "no_primary"),
+            (&[Failure::Timeout], "timeout"),
+            (&[Failure::Io], "connection"),
+            (CONNECTION_DRIVER_ERRORS, "connection"),
+            (
+                &[
+                    Failure::Server(1290),
+                    Failure::Server(1836),
+                    Failure::Server(4049),
+                ],
+                "read_only",
+            ),
+            (
+                &[Failure::Server(1040), Failure::Server(1203)],
+                "too_many_connections",
+            ),
+            (&[Failure::Server(1205), Failure::Server(1213)], "lock"),
+            (&[Failure::Server(1045)], "access_denied"),
+            (&[Failure::Fence], "fence"),
+            (
+                &[
+                    Failure::Server(1062),
+                    Failure::Server(1146),
+                    Failure::Server(1053),
+                    Failure::Server(1231),
+                ],
+                "server",
+            ),
+            (OTHER_DRIVER_ERRORS, "client"),
+            (&[Failure::Url], "client"),
+        ];
+        for (failures, class) in expected {
+            for failure in *failures {
+                for phase in PHASES {
+                    for scope in [ErrorScope::Query, ErrorScope::Transaction] {
+                        let err = tagged(phase, OssStmt::Write, *failure);
+                        assert_eq!(error_class(&err, scope), *class, "{phase:?}: {failure:?}");
+                    }
+                }
+            }
+        }
+
+        // Without a tag, by the first mysql_async error in the chain.
+        let untagged = anyhow::Error::from(mysql_error(Failure::Server(1836))).context("query Foo");
+        assert_eq!(error_class(&untagged, ErrorScope::Query), "read_only");
+        let other = anyhow::Error::from(MysqlError::Other(Box::new(io::Error::other("custom"))));
+        assert_eq!(error_class(&other, ErrorScope::Transaction), "client");
+
+        // Neither: SQLite, or a row that does not parse.
+        assert_eq!(
+            error_class(&anyhow!("row parse error"), ErrorScope::Query),
+            "non_mysql"
+        );
+        let sqlite = anyhow::Error::from(io::Error::other("database is locked")).context("sqlite");
+        assert_eq!(error_class(&sqlite, ErrorScope::Transaction), "non_mysql");
     }
 }

@@ -154,6 +154,10 @@ pub struct EnvironmentArgs {
 
 impl MononokeAppBuilder {
     pub fn new(fb: FacebookInit) -> Self {
+        // Without fb303 the stats would be discarded: keep them in memory instead. This only
+        // takes effect if no stat was used before the app is built.
+        #[cfg(not(fbcode_build))]
+        stats::memory_stats::install();
         MononokeAppBuilder {
             fb,
             extensions: Vec::new(),
