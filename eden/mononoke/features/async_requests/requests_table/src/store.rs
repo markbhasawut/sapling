@@ -503,19 +503,42 @@ mononoke_queries! {
         "
     }
 
-    read AddRequestWithRepoAndRootIfAbsent(request_type: RequestType, repo_id: RepositoryId, args_blobstore_key: BlobstoreKey, created_at: Timestamp, root_request_id: RowId, created_by: Option<String>) -> (RowId) {
+    // Inserts a request unless one with the same dedupe key
+    // (root_request_id, request_type, repo_id, args_blobstore_key) exists.
+    // `add_request_with_root` and `add_request_with_dependencies_and_root`
+    // pick this or AddRequestWithRepoAndRootIfAbsentReturning by backend and
+    // return the id of the new or the existing row.
+    //
+    // MySQL has no INSERT ... RETURNING, so on MySQL this is a write:
+    // `id = LAST_INSERT_ID(id)` makes the OK packet carry the existing row's
+    // id when the key matches, so `last_insert_id()` is the request's id
+    // either way. Being a write, it is never retried once its outcome is
+    // unknown. Its SQLite text is the same insert without the id; SQLite uses
+    // AddRequestWithRepoAndRootIfAbsentReturning instead.
+    write AddRequestWithRepoAndRootIfAbsent(request_type: RequestType, repo_id: RepositoryId, args_blobstore_key: BlobstoreKey, created_at: Timestamp, root_request_id: RowId, created_by: Option<String>) {
+        none,
         mysql("INSERT INTO long_running_request_queue
             (request_type, repo_id, args_blobstore_key, status, created_at, root_request_id, created_by)
          VALUES ({request_type}, {repo_id}, {args_blobstore_key}, 'new', {created_at}, {root_request_id}, {created_by})
-         ON DUPLICATE KEY UPDATE id = id
-         RETURNING id
+         ON DUPLICATE KEY UPDATE id = LAST_INSERT_ID(id)
         ")
         sqlite("INSERT INTO long_running_request_queue
             (request_type, repo_id, args_blobstore_key, status, created_at, root_request_id, created_by)
          VALUES ({request_type}, {repo_id}, {args_blobstore_key}, 'new', {created_at}, {root_request_id}, {created_by})
+         ON CONFLICT(root_request_id, request_type, repo_id, args_blobstore_key) DO NOTHING
+        ")
+    }
+
+    // SQLite only: the same insert, returning the id of the new or the
+    // existing row through RETURNING, which MySQL lacks. Its callers check
+    // `is_sqlite` first, so it never runs on MySQL.
+    read AddRequestWithRepoAndRootIfAbsentReturning(request_type: RequestType, repo_id: RepositoryId, args_blobstore_key: BlobstoreKey, created_at: Timestamp, root_request_id: RowId, created_by: Option<String>) -> (RowId) {
+        "INSERT INTO long_running_request_queue
+            (request_type, repo_id, args_blobstore_key, status, created_at, root_request_id, created_by)
+         VALUES ({request_type}, {repo_id}, {args_blobstore_key}, 'new', {created_at}, {root_request_id}, {created_by})
          ON CONFLICT(root_request_id, request_type, repo_id, args_blobstore_key) DO UPDATE SET id = id
          RETURNING id
-        ")
+        "
     }
 
     write AddRequestWithRoot(request_type: RequestType, args_blobstore_key: BlobstoreKey, created_at: Timestamp, root_request_id: RowId, created_by: Option<String>) {
@@ -1586,6 +1609,36 @@ fn row_to_entry(
     }
 }
 
+/// Whether `connection` is SQLite, the one backend with INSERT ... RETURNING.
+fn is_sqlite(connection: &sql::Connection) -> bool {
+    matches!(connection, sql::Connection::Sqlite(_))
+}
+
+/// Whether `transaction` runs on SQLite (see [`is_sqlite`]).
+fn is_sqlite_transaction(transaction: &sql::Transaction) -> bool {
+    matches!(transaction, sql::Transaction::Sqlite(_))
+}
+
+/// The request id that AddRequestWithRepoAndRootIfAbsentReturning returned.
+fn returned_request_id(rows: Vec<(RowId,)>, request_type: &RequestType) -> Result<RowId> {
+    rows.into_iter()
+        .next()
+        .map(|(row_id,)| row_id)
+        .ok_or_else(|| anyhow::anyhow!("Failed to find request of type {request_type}"))
+}
+
+/// The request id that AddRequestWithRepoAndRootIfAbsent reports on MySQL:
+/// the new row's, or the existing row's through LAST_INSERT_ID(id).
+fn inserted_or_existing_request_id(
+    res: &sql::WriteResult,
+    request_type: &RequestType,
+) -> Result<RowId> {
+    match res.last_insert_id() {
+        Some(id) if id != 0 => Ok(RowId(id)),
+        _ => bail!("Failed to find request of type {request_type}"),
+    }
+}
+
 #[derive(Clone)]
 pub struct SqlLongRunningRequestsQueue {
     pub(crate) connections: SqlConnections,
@@ -2365,21 +2418,34 @@ impl LongRunningRequestsQueue for SqlLongRunningRequestsQueue {
         let now = Timestamp::now();
         match repo_id {
             Some(repo_id) => {
-                let rows = AddRequestWithRepoAndRootIfAbsent::query(
-                    &self.connections.write_connection,
-                    ctx.sql_query_telemetry(),
-                    request_type,
-                    repo_id,
-                    args_blobstore_key,
-                    &now,
-                    root_request_id,
-                    &created_by_owned,
-                )
-                .await?;
-                rows.into_iter()
-                    .next()
-                    .map(|(row_id,)| row_id)
-                    .ok_or_else(|| anyhow::anyhow!("Failed to find request of type {request_type}"))
+                let connection = &self.connections.write_connection;
+                if is_sqlite(connection.sql_connection()) {
+                    let rows = AddRequestWithRepoAndRootIfAbsentReturning::query(
+                        connection,
+                        ctx.sql_query_telemetry(),
+                        request_type,
+                        repo_id,
+                        args_blobstore_key,
+                        &now,
+                        root_request_id,
+                        &created_by_owned,
+                    )
+                    .await?;
+                    returned_request_id(rows, request_type)
+                } else {
+                    let res = AddRequestWithRepoAndRootIfAbsent::query(
+                        connection,
+                        ctx.sql_query_telemetry(),
+                        request_type,
+                        repo_id,
+                        args_blobstore_key,
+                        &now,
+                        root_request_id,
+                        &created_by_owned,
+                    )
+                    .await?;
+                    inserted_or_existing_request_id(&res, request_type)
+                }
             }
             None => {
                 let res = AddRequestWithRoot::query(
@@ -2420,24 +2486,32 @@ impl LongRunningRequestsQueue for SqlLongRunningRequestsQueue {
         let now = Timestamp::now();
         let (mut txn, row_id) = match repo_id {
             Some(repo_id) => {
-                let (txn, rows) = AddRequestWithRepoAndRootIfAbsent::query_with_transaction(
-                    txn,
-                    request_type,
-                    repo_id,
-                    args_blobstore_key,
-                    &now,
-                    root_request_id,
-                    &created_by_owned,
-                )
-                .await?;
-                let row_id = rows
-                    .into_iter()
-                    .next()
-                    .map(|(row_id,)| row_id)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("Failed to find request of type {request_type}")
-                    })?;
-                (txn, row_id)
+                if is_sqlite_transaction(&txn.inner) {
+                    let (txn, rows) =
+                        AddRequestWithRepoAndRootIfAbsentReturning::query_with_transaction(
+                            txn,
+                            request_type,
+                            repo_id,
+                            args_blobstore_key,
+                            &now,
+                            root_request_id,
+                            &created_by_owned,
+                        )
+                        .await?;
+                    (txn, returned_request_id(rows, request_type)?)
+                } else {
+                    let (txn, res) = AddRequestWithRepoAndRootIfAbsent::query_with_transaction(
+                        txn,
+                        request_type,
+                        repo_id,
+                        args_blobstore_key,
+                        &now,
+                        root_request_id,
+                        &created_by_owned,
+                    )
+                    .await?;
+                    (txn, inserted_or_existing_request_id(&res, request_type)?)
+                }
             }
             None => {
                 let (txn, res) = AddRequestWithRoot::query_with_transaction(

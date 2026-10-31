@@ -287,7 +287,7 @@ mod test {
     mononoke_queries! {
         write InsertState(repo_id: RepositoryId, state: u8, reason: Option<&str>) {
             none,
-            "INSERT OR REPLACE INTO repo_lock (repo_id, state, reason)
+            "REPLACE INTO repo_lock (repo_id, state, reason)
             VALUES ({repo_id}, {state}, {reason})"
         }
     }

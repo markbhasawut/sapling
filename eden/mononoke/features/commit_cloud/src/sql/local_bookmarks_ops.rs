@@ -26,24 +26,42 @@ pub struct DeleteArgs {
     pub removed_bookmarks: Vec<String>,
 }
 
+// The MySQL name of the workspace bookmarks table. Meta's commit cloud
+// database calls it `bookmarks`. Open-source builds keep commit cloud in the
+// same database as Mononoke's own `bookmarks` table (`SqlCommitCloudBuilder`
+// uses the `production` database), so they use SQLite's name instead; see
+// schemas/mysql-commit-cloud.sql.
+#[cfg(fbcode_build)]
+macro_rules! workspace_bookmarks_table {
+    () => {
+        "bookmarks"
+    };
+}
+#[cfg(not(fbcode_build))]
+macro_rules! workspace_bookmarks_table {
+    () => {
+        "workspacebookmarks"
+    };
+}
+
 mononoke_queries! {
     read GetLocalBookmarks(reponame: String, workspace: String) -> (String,  CloudChangesetId){
-        mysql("SELECT `name`, `node` FROM `bookmarks` WHERE `reponame`={reponame} AND `workspace`={workspace}")
+        mysql(concat!("SELECT `name`, `node` FROM `", workspace_bookmarks_table!(), "` WHERE `reponame`={reponame} AND `workspace`={workspace}"))
         sqlite("SELECT `name`, `commit` FROM `workspacebookmarks` WHERE `reponame`={reponame} AND `workspace`={workspace}")
     }
     write DeleteLocalBookmark(reponame: String, workspace: String, >list removed_bookmarks: String) {
         none,
-        mysql("DELETE FROM `bookmarks` WHERE `reponame`={reponame} AND `workspace`={workspace} AND `name` IN {removed_bookmarks}")
+        mysql(concat!("DELETE FROM `", workspace_bookmarks_table!(), "` WHERE `reponame`={reponame} AND `workspace`={workspace} AND `name` IN {removed_bookmarks}"))
         sqlite("DELETE FROM `workspacebookmarks` WHERE `reponame`={reponame} AND `workspace`={workspace} AND `name` IN {removed_bookmarks}")
     }
     write InsertLocalBookmark(reponame: String, workspace: String, name: String, commit: CloudChangesetId) {
         none,
-        mysql("INSERT INTO `bookmarks` (`reponame`, `workspace`, `name`, `node`) VALUES ({reponame}, {workspace}, {name}, {commit})")
+        mysql(concat!("INSERT INTO `", workspace_bookmarks_table!(), "` (`reponame`, `workspace`, `name`, `node`) VALUES ({reponame}, {workspace}, {name}, {commit})"))
         sqlite("INSERT INTO `workspacebookmarks` (`reponame`, `workspace`, `name`, `commit`) VALUES ({reponame}, {workspace}, {name}, {commit})")
     }
     write UpdateWorkspaceName( reponame: String, workspace: String, new_workspace: String) {
         none,
-        mysql("UPDATE `bookmarks` SET workspace = {new_workspace} WHERE workspace = {workspace} and reponame = {reponame}")
+        mysql(concat!("UPDATE `", workspace_bookmarks_table!(), "` SET workspace = {new_workspace} WHERE workspace = {workspace} and reponame = {reponame}"))
         sqlite("UPDATE `workspacebookmarks` SET workspace = {new_workspace} WHERE workspace = {workspace} and reponame = {reponame}")
     }
 }

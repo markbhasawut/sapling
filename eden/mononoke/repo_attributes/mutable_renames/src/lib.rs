@@ -550,7 +550,11 @@ mononoke_queries! {
         dst_path_hash: Vec<u8>,
     )) {
         none,
-        "DELETE FROM mutable_renames WHERE (repo_id, dst_cs_id, dst_path_hash) IN (VALUES {values})"
+        // On MySQL `{values}` is every row, "(a, b, c), (d, e, f)", and a
+        // VALUES row constructor needs ROW(...); a plain row list works.
+        // SQLite runs the statement once per row with "(:a, :b, :c)".
+        mysql("DELETE FROM mutable_renames WHERE (repo_id, dst_cs_id, dst_path_hash) IN ({values})")
+        sqlite("DELETE FROM mutable_renames WHERE (repo_id, dst_cs_id, dst_path_hash) IN (VALUES {values})")
     }
 
     write DeletePaths(>list path_hashes: &Vec<u8>) {
