@@ -24,7 +24,7 @@ ignore the scuba logs logged while starting the server
   $ setup_common_hg_configs
 
 Run a few requests that use different codepaths for logging server-side
-  $ sslcurl -s "https://localhost:$MONONOKE_SOCKET/edenapi/repos"
+  $ sslcurlas client0 -s "https://localhost:$MONONOKE_SOCKET/edenapi/repos"
   {"repos":["repo"]} (no-eol)
 
   $ hg debugapi mono:repo -e uploadfilecontents -i '[({"Sha1":"03cfd743661f07975fa2f1220c5194cbaff48451"}, b"abc\n")]' > /dev/null

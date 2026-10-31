@@ -77,6 +77,7 @@ use mononoke_types::DateTime;
 use mononoke_types::RepoPath;
 use mononoke_types::hash::GitSha1;
 use phases::PhasesRef;
+use repo_authorization::RepoWriteOperation;
 use repo_blobstore::RepoBlobstore;
 use repo_blobstore::RepoBlobstoreRef;
 use repo_client::find_new_draft_commits_and_derive_filenodes_for_public_roots;
@@ -172,12 +173,24 @@ impl<R: MononokeRepo> HgRepoContext<R> {
         self.repo_ctx.config()
     }
 
+    /// Uploads add draft data to the repo, so they need the access that
+    /// creating a draft commit needs, not just the read access that opening
+    /// the repo checked.
+    async fn require_upload_access(&self) -> Result<(), MononokeError> {
+        self.repo_ctx
+            .authorization_context()
+            .require_repo_write(self.ctx(), self.repo(), RepoWriteOperation::CreateChangeset)
+            .await?;
+        Ok(())
+    }
+
     /// Create bubble and return its id
     pub async fn create_bubble(
         &self,
         custom_duration: Option<Duration>,
         labels: Vec<String>,
     ) -> Result<Bubble, MononokeError> {
+        self.require_upload_access().await?;
         Ok(self
             .repo_ctx()
             .repo_ephemeral_store_arc()
@@ -301,6 +314,7 @@ impl<R: MononokeRepo> HgRepoContext<R> {
         bubble_id: Option<BubbleId>,
         bypass_redaction: bool,
     ) -> Result<ContentMetadataV2, MononokeError> {
+        self.require_upload_access().await?;
         let blobstore = self.bubble_blobstore(bubble_id).await?;
         let blobstore = if bypass_redaction {
             blobstore.with_log_only_redaction()
@@ -449,6 +463,7 @@ impl<R: MononokeRepo> HgRepoContext<R> {
         content_size: u64,
         metadata: Bytes,
     ) -> Result<(), MononokeError> {
+        self.require_upload_access().await?;
         let envelope = HgFileEnvelopeMut {
             node_id: filenode_id,
             p1,
@@ -500,6 +515,7 @@ impl<R: MononokeRepo> HgRepoContext<R> {
         contents: Bytes,
         computed_node_id: Option<HgNodeHash>,
     ) -> Result<HgManifestEnvelope, MononokeError> {
+        self.require_upload_access().await?;
         if computed_node_id.is_some() {
             self.repo_ctx
                 .authorization_context()
@@ -588,6 +604,7 @@ impl<R: MononokeRepo> HgRepoContext<R> {
         changesets: Vec<(HgChangesetId, RevlogChangeset, Option<BonsaiChangeset>)>,
         mutations: Vec<HgMutationEntry>,
     ) -> Result<Vec<Result<(HgBlobChangeset, BonsaiChangeset), MononokeError>>, MononokeError> {
+        self.require_upload_access().await?;
         let mut uploaded_changesets: HashMap<HgChangesetId, ChangesetHandle> = HashMap::new();
         let filelogs = HashMap::new();
         let manifests = HashMap::new();
