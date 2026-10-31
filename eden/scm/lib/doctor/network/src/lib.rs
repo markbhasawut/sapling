@@ -18,9 +18,16 @@ use configmodel::Config;
 use configmodel::ConfigExt;
 use http_client::HttpClientError;
 use http_client::curl;
+use serde::Deserialize;
 use thiserror::Error;
 use url::Host;
 use url::Url;
+
+/// Failing server checks shown in a diagnosis; the rest are counted.
+const MAX_REPORTED_CHECKS: usize = 5;
+
+/// Longest server check detail shown in a diagnosis, in characters.
+const MAX_CHECK_DETAIL_CHARS: usize = 200;
 
 #[derive(Debug, Error)]
 pub enum HostError {
@@ -58,6 +65,101 @@ pub enum Diagnosis {
     AuthProxyProblem(HttpError),
     #[error("http connection problem: {0}")]
     HttpProblem(HttpError),
+    #[error("{0}")]
+    ServerUnhealthy(ServerHealth),
+}
+
+/// Health the server reports for itself at `<edenapi.url>/<repo>/server_health`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServerStatus {
+    Degraded,
+    Down,
+}
+
+impl fmt::Display for ServerStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ServerStatus::Degraded => write!(f, "degraded"),
+            ServerStatus::Down => write!(f, "down"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServerCheck {
+    pub name: String,
+    pub status: String,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServerHealth {
+    pub status: ServerStatus,
+    /// The server's checks whose status is not "ok", in the server's order.
+    pub failing_checks: Vec<ServerCheck>,
+}
+
+impl fmt::Display for ServerHealth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "server reports {} health: ", self.status)?;
+
+        if self.failing_checks.is_empty() {
+            return write!(f, "no failing checks reported");
+        }
+
+        for (i, check) in self
+            .failing_checks
+            .iter()
+            .take(MAX_REPORTED_CHECKS)
+            .enumerate()
+        {
+            if i > 0 {
+                write!(f, "; ")?;
+            }
+            write!(f, "{}", single_line(&check.name))?;
+            if !check.detail.is_empty() {
+                let detail = single_line(&check.detail);
+                match detail.char_indices().nth(MAX_CHECK_DETAIL_CHARS) {
+                    Some((end, _)) => write!(f, ": {}...", &detail[..end])?,
+                    None => write!(f, ": {detail}")?,
+                }
+            }
+        }
+
+        if self.failing_checks.len() > MAX_REPORTED_CHECKS {
+            write!(
+                f,
+                "; and {} more",
+                self.failing_checks.len() - MAX_REPORTED_CHECKS
+            )?;
+        }
+
+        Ok(())
+    }
+}
+
+// Server text must not break the one-line diagnosis (eden doctor parses it)
+// or reach the terminal as control sequences.
+fn single_line(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
+// Body of `server_health`. Only these fields are read; others are ignored.
+#[derive(Deserialize)]
+struct ServerHealthResponse {
+    status: String,
+    #[serde(default)]
+    checks: Vec<ServerHealthResponseCheck>,
+}
+
+#[derive(Deserialize)]
+struct ServerHealthResponseCheck {
+    name: String,
+    status: String,
+    #[serde(default)]
+    detail: Option<String>,
 }
 
 pub struct HttpResponse {
@@ -121,6 +223,16 @@ impl Diagnosis {
                 msg
             }
             Self::HttpProblem(err) => diagnose_http_error(config, err),
+            Self::ServerUnhealthy(health) => {
+                let mut msg = format!(
+                    "The Mononoke server reports {} health. The problem is on the server, not with your network or configuration: retry later, and contact the server's administrators if it persists.",
+                    health.status
+                );
+                if let Some(help) = config.get("help", "server-health-help") {
+                    msg = format!("{}\n\n{}", msg, help.as_ref());
+                }
+                msg
+            }
         }
     }
 
@@ -131,6 +243,7 @@ impl Diagnosis {
             Diagnosis::NoServer(_) => "no_corp".to_string(),
             Diagnosis::AuthProxyProblem(err) => format!("auth_proxy_problem({})", err.short_name()),
             Diagnosis::HttpProblem(err) => format!("http_problem({})", err.short_name()),
+            Diagnosis::ServerUnhealthy(health) => format!("server_unhealthy({})", health.status),
         }
     }
 }
@@ -304,7 +417,9 @@ impl Doctor {
                 return http_error;
             }
 
-            host_error.and(http_error)
+            host_error
+                .and(http_error)
+                .and_then(|()| self.check_server_health(config))
         }();
 
         let short_res = match &res {
@@ -340,26 +455,9 @@ impl Doctor {
     }
 
     fn check_http_connectivity(&self, config: &dyn Config) -> Result<(), Diagnosis> {
-        let mut url = config_url(config, "edenapi", "url", None)?;
-        let repo_name = match config
-            .get("remotefilelog", "reponame")
-            // Try a default reponame so network doctor works outside a repo context.
-            .or_else(|| config.get("network-doctor", "default-reponame"))
-        {
-            Some(name) => name.to_string(),
-            None => {
-                return Err(Diagnosis::BadConfig(
-                    "remotefilelog.reponame is not set".to_string(),
-                ));
-            }
-        };
-
         // Build edenpi/:repo/capabilities URL. This will suss out permission
         // errors (as opposed to :repo/health_check).
-        match url.path_segments_mut() {
-            Ok(mut path) => path.pop_if_empty().push(&repo_name).push("capabilities"),
-            Err(()) => return Err(Diagnosis::BadConfig("bad edenapi.url".into())),
-        };
+        let url = repo_url(config, "capabilities")?;
 
         let mut x2pagentd_err = None;
         if use_x2pagentd(config, &url) {
@@ -377,6 +475,81 @@ impl Doctor {
         }
     }
 
+    // Ask the server how it is doing. The server is reachable at this point,
+    // so anything other than a "degraded" or "down" report (servers without
+    // the route, errors, timeouts, unknown answers) is not a problem.
+    fn check_server_health(&self, config: &dyn Config) -> Result<(), Diagnosis> {
+        let enabled = config
+            .get_opt::<bool>("doctor", "server-health-check")
+            .unwrap_or_else(|err| {
+                tracing::warn!(%err, "invalid doctor.server-health-check");
+                None
+            })
+            .unwrap_or(true);
+        if !enabled {
+            return Ok(());
+        }
+
+        let timeout = config
+            .get_opt::<Duration>("doctor", "server-health-timeout")
+            .unwrap_or_else(|err| {
+                tracing::warn!(%err, "invalid doctor.server-health-timeout");
+                None
+            })
+            .unwrap_or(Duration::from_secs(2));
+
+        let url = repo_url(config, "server_health")?;
+        let use_x2pagentd = use_x2pagentd(config, &url);
+        tracing::debug!(%url, use_x2pagentd, ?timeout, "check_server_health");
+
+        let res = match self.fetch(config, &url, use_x2pagentd, timeout) {
+            Ok(res) => res,
+            Err(err) => {
+                tracing::debug!(%url, %err, "server health request failed, skipping");
+                return Ok(());
+            }
+        };
+
+        if !res.status.is_success() {
+            // Servers without the route answer 404 (or 405).
+            tracing::debug!(%url, status=%res.status, "no server health, skipping");
+            return Ok(());
+        }
+
+        let report: ServerHealthResponse = match serde_json::from_slice(&res.body) {
+            Ok(report) => report,
+            Err(err) => {
+                tracing::debug!(%url, %err, "unparseable server health, skipping");
+                return Ok(());
+            }
+        };
+
+        let status = match report.status.as_str() {
+            "degraded" => ServerStatus::Degraded,
+            "down" => ServerStatus::Down,
+            status => {
+                tracing::debug!(%url, status, "server health is not a problem");
+                return Ok(());
+            }
+        };
+
+        let failing_checks = report
+            .checks
+            .into_iter()
+            .filter(|check| check.status != "ok")
+            .map(|check| ServerCheck {
+                name: check.name,
+                status: check.status,
+                detail: check.detail.unwrap_or_default(),
+            })
+            .collect();
+
+        Err(Diagnosis::ServerUnhealthy(ServerHealth {
+            status,
+            failing_checks,
+        }))
+    }
+
     fn check_host_http(
         &self,
         config: &dyn Config,
@@ -385,6 +558,21 @@ impl Doctor {
     ) -> Result<(), HttpError> {
         tracing::debug!(%url, use_x2pagentd, "check_host_http");
 
+        let res = self.fetch(config, url, use_x2pagentd, Duration::from_secs(3))?;
+        if res.status.is_success() {
+            Ok(())
+        } else {
+            Err(HttpError::UnexpectedResponse(res))
+        }
+    }
+
+    fn fetch(
+        &self,
+        config: &dyn Config,
+        url: &Url,
+        use_x2pagentd: bool,
+        timeout: Duration,
+    ) -> Result<HttpResponse, HttpError> {
         let mut hc = hg_http::http_config(config, url)?;
 
         if !use_x2pagentd {
@@ -404,7 +592,7 @@ impl Doctor {
             stub(url, use_x2pagentd)
         } else {
             let mut req = hg_http::http_client("network-doctor", hc.clone()).get(url.clone());
-            req.set_timeout(Duration::from_secs(3));
+            req.set_timeout(timeout);
             req.send().map(|res| HttpResponse {
                 status: res.status(),
                 headers: res.headers().clone(),
@@ -413,8 +601,7 @@ impl Doctor {
         };
 
         match result {
-            Ok(res) if res.status.is_success() => Ok(()),
-            Ok(res) => Err(HttpError::UnexpectedResponse(res)),
+            Ok(res) => Ok(res),
             Err(err) => {
                 if let HttpClientError::Tls(_) = err {
                     if let Some(cert_path) = &hc.cert_path {
@@ -443,6 +630,30 @@ fn use_x2pagentd(config: &dyn Config, url: &Url) -> bool {
         None => false,
         Some(domain) => hc.unix_socket_domains.contains(domain),
     }
+}
+
+// Build the edenapi/:repo/<endpoint> URL.
+fn repo_url(config: &dyn Config, endpoint: &str) -> Result<Url, Diagnosis> {
+    let mut url = config_url(config, "edenapi", "url", None)?;
+    let repo_name = match config
+        .get("remotefilelog", "reponame")
+        // Try a default reponame so network doctor works outside a repo context.
+        .or_else(|| config.get("network-doctor", "default-reponame"))
+    {
+        Some(name) => name.to_string(),
+        None => {
+            return Err(Diagnosis::BadConfig(
+                "remotefilelog.reponame is not set".to_string(),
+            ));
+        }
+    };
+
+    match url.path_segments_mut() {
+        Ok(mut path) => path.pop_if_empty().push(&repo_name).push(endpoint),
+        Err(()) => return Err(Diagnosis::BadConfig("bad edenapi.url".into())),
+    };
+
+    Ok(url)
 }
 
 // Extract and parse URL from config with optional default if no config value.
@@ -686,6 +897,254 @@ mod tests {
                 _ => panic!(),
             };
         }
+    }
+
+    #[test]
+    fn test_check_server_health() {
+        let td = tempdir().unwrap();
+
+        let fake_cert_path = td.path().join("cert");
+        std::fs::write(&fake_cert_path, "foo").unwrap();
+
+        let mut cfg = BTreeMap::new();
+        cfg.insert("edenapi.url", "https://example.com/edenapi/");
+        cfg.insert("remotefilelog.reponame", "some_repo");
+        cfg.insert("auth.test.prefix", "*");
+        cfg.insert("auth.test.cert", fake_cert_path.to_str().unwrap());
+        cfg.insert("auth.test.key", fake_cert_path.to_str().unwrap());
+
+        fn check(
+            cfg: &BTreeMap<&str, &str>,
+            res: impl Fn() -> Result<HttpResponse, HttpClientError> + 'static,
+        ) -> Result<(), Diagnosis> {
+            let mut doc = Doctor::new();
+            doc.stub_healthcheck_response = Some(Box::new(move |url, _x2p| {
+                assert_eq!(url.path(), "/edenapi/some_repo/server_health");
+                res()
+            }));
+            doc.check_server_health(cfg)
+        }
+
+        // Healthy server.
+        assert!(matches!(
+            check(&cfg, || Ok(response!(
+                StatusCode::OK,
+                br#"{"status":"ok","checks":[]}"#
+            ))),
+            Ok(())
+        ));
+
+        // Servers without the route, failing servers and odd answers are not
+        // diagnosed, whatever the body of an error says.
+        for status in [
+            StatusCode::NOT_FOUND,
+            StatusCode::METHOD_NOT_ALLOWED,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            assert!(matches!(check(&cfg, move || Ok(response!(status))), Ok(())));
+            assert!(matches!(
+                check(&cfg, move || Ok(response!(
+                    status,
+                    br#"{"status":"down","checks":[]}"#
+                ))),
+                Ok(())
+            ));
+        }
+        for body in [&b"not json"[..], &br#"{"status":"weird"}"#[..]] {
+            assert!(matches!(
+                check(&cfg, move || Ok(response!(StatusCode::OK, body))),
+                Ok(())
+            ));
+        }
+        assert!(matches!(
+            check(&cfg, || Err(HttpClientError::Curl(curl::Error::new(28)))),
+            Ok(())
+        ));
+
+        // Degraded server: only the failing checks are kept.
+        let degraded = br#"{
+            "schema": 1,
+            "status": "degraded",
+            "checks": [
+                {"name": "server", "status": "ok", "detail": "serving"},
+                {"name": "metadata_db", "status": "degraded", "detail": "cluster 1 (identity): a new primary awaits confirmation"}
+            ],
+            "sql": null
+        }"#;
+        match check(&cfg, move || Ok(response!(StatusCode::OK, degraded))) {
+            Err(Diagnosis::ServerUnhealthy(health)) => assert_eq!(
+                health,
+                ServerHealth {
+                    status: ServerStatus::Degraded,
+                    failing_checks: vec![ServerCheck {
+                        name: "metadata_db".to_string(),
+                        status: "degraded".to_string(),
+                        detail: "cluster 1 (identity): a new primary awaits confirmation"
+                            .to_string(),
+                    }],
+                }
+            ),
+            res => panic!("unexpected result {res:?}"),
+        }
+
+        // Down server, check without a detail.
+        let down = br#"{"status":"down","checks":[{"name":"metadata_db","status":"down"}]}"#;
+        match check(&cfg, move || Ok(response!(StatusCode::OK, down))) {
+            Err(Diagnosis::ServerUnhealthy(health)) => assert_eq!(
+                health,
+                ServerHealth {
+                    status: ServerStatus::Down,
+                    failing_checks: vec![ServerCheck {
+                        name: "metadata_db".to_string(),
+                        status: "down".to_string(),
+                        detail: "".to_string(),
+                    }],
+                }
+            ),
+            res => panic!("unexpected result {res:?}"),
+        }
+
+        // Disabled.
+        {
+            let mut cfg = cfg.clone();
+            cfg.insert("doctor.server-health-check", "false");
+            assert!(matches!(
+                check(&cfg, || panic!("server health requested")),
+                Ok(())
+            ));
+        }
+
+        // Invalid settings fall back to the defaults.
+        {
+            let mut cfg = cfg.clone();
+            cfg.insert("doctor.server-health-check", "maybe");
+            cfg.insert("doctor.server-health-timeout", "soon");
+            assert!(matches!(
+                check(&cfg, move || Ok(response!(StatusCode::OK, down))),
+                Err(Diagnosis::ServerUnhealthy(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn test_diagnose_checks_server_health_after_capabilities() {
+        let td = tempdir().unwrap();
+
+        let fake_cert_path = td.path().join("cert");
+        std::fs::write(&fake_cert_path, "foo").unwrap();
+
+        let mut cfg = BTreeMap::new();
+        cfg.insert("edenapi.url", "https://test_succeed/edenapi/");
+        cfg.insert("remotefilelog.reponame", "some_repo");
+        cfg.insert("auth.test.prefix", "*");
+        cfg.insert("auth.test.cert", fake_cert_path.to_str().unwrap());
+        cfg.insert("auth.test.key", fake_cert_path.to_str().unwrap());
+
+        let mut doc = Doctor::new();
+
+        // Capabilities work, the server reports itself degraded.
+        doc.stub_healthcheck_response = Some(Box::new(|url, _x2p| match url.path() {
+            "/edenapi/some_repo/capabilities" => Ok(response!(StatusCode::OK)),
+            "/edenapi/some_repo/server_health" => Ok(response!(
+                StatusCode::OK,
+                br#"{"status":"degraded","checks":[{"name":"sql","status":"degraded"}]}"#
+            )),
+            path => panic!("unexpected request {path}"),
+        }));
+        assert!(matches!(
+            doc.diagnose(&cfg),
+            Err(Diagnosis::ServerUnhealthy(ServerHealth {
+                status: ServerStatus::Degraded,
+                ..
+            }))
+        ));
+
+        // Servers without the route are fine.
+        doc.stub_healthcheck_response = Some(Box::new(|url, _x2p| match url.path() {
+            "/edenapi/some_repo/capabilities" => Ok(response!(StatusCode::OK)),
+            _ => Ok(response!(StatusCode::NOT_FOUND)),
+        }));
+        assert!(matches!(doc.diagnose(&cfg), Ok(())));
+
+        // Capabilities fail: server health is not asked.
+        doc.stub_healthcheck_response = Some(Box::new(|url, _x2p| match url.path() {
+            "/edenapi/some_repo/capabilities" => Ok(response!(StatusCode::FORBIDDEN)),
+            path => panic!("unexpected request {path}"),
+        }));
+        assert!(matches!(
+            doc.diagnose(&cfg),
+            Err(Diagnosis::HttpProblem(HttpError::UnexpectedResponse(
+                HttpResponse {
+                    status: StatusCode::FORBIDDEN,
+                    ..
+                }
+            )))
+        ));
+    }
+
+    #[test]
+    fn test_server_health_text() {
+        let check = |name: &str, detail: &str| ServerCheck {
+            name: name.to_string(),
+            status: "degraded".to_string(),
+            detail: detail.to_string(),
+        };
+
+        let degraded = Diagnosis::ServerUnhealthy(ServerHealth {
+            status: ServerStatus::Degraded,
+            failing_checks: vec![check(
+                "metadata_db",
+                "cluster 1 (identity): a new primary awaits confirmation",
+            )],
+        });
+        assert_eq!(
+            degraded.to_string(),
+            "server reports degraded health: metadata_db: cluster 1 (identity): a new primary awaits confirmation"
+        );
+        assert_eq!(
+            degraded.treatment(&BTreeMap::<&str, &str>::new()),
+            "The Mononoke server reports degraded health. The problem is on the server, not with your network or configuration: retry later, and contact the server's administrators if it persists."
+        );
+        assert_eq!(
+            degraded.treatment(&BTreeMap::from([(
+                "help.server-health-help",
+                "See the status page."
+            )])),
+            "The Mononoke server reports degraded health. The problem is on the server, not with your network or configuration: retry later, and contact the server's administrators if it persists.\n\nSee the status page."
+        );
+        assert_eq!(degraded.short_name(), "server_unhealthy(degraded)");
+
+        let down = Diagnosis::ServerUnhealthy(ServerHealth {
+            status: ServerStatus::Down,
+            failing_checks: vec![],
+        });
+        assert_eq!(
+            down.to_string(),
+            "server reports down health: no failing checks reported"
+        );
+        assert_eq!(down.short_name(), "server_unhealthy(down)");
+
+        // At most 5 checks, each on one line, long details cut.
+        let health = ServerHealth {
+            status: ServerStatus::Down,
+            failing_checks: vec![
+                check("a\tb", "line\r\none"),
+                check("empty", ""),
+                check("long", &"x".repeat(250)),
+                check("exact", &"é".repeat(200)),
+                check("e", "5"),
+                check("f", "6"),
+                check("g", "7"),
+            ],
+        };
+        assert_eq!(
+            health.to_string(),
+            format!(
+                "server reports down health: a b: line  one; empty; long: {}...; exact: {}; e: 5; and 2 more",
+                "x".repeat(200),
+                "é".repeat(200),
+            )
+        );
     }
 
     #[test]
