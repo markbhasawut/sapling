@@ -24,6 +24,13 @@ use crate::Matcher;
 pub struct GitignoreMatcher {
     ignore: gitignore::Gitignore,
 
+    // The directory of this matcher's `.gitignore`. `ignore.path()` cannot
+    // stand in for it: the `ignore` crate builds a `Gitignore` with no rules
+    // as `Gitignore::empty()`, whose path is "", which would make every path
+    // below a directory without a `.gitignore` relative to the process's
+    // current directory instead of the repo.
+    dir: PathBuf,
+
     // PERF: Each Gitignore object stores "root" as "PathBuf" to support
     // matching against an absolute path. Since we enforce relative path
     // in the API, removing that "PathBuf" could reduce memory footprint.
@@ -100,6 +107,7 @@ impl GitignoreMatcher {
         let submatchers = RwLock::new(HashMap::new());
         GitignoreMatcher {
             ignore,
+            dir: root.to_path_buf(),
             submatchers,
             ignored: false,
             case_sensitive,
@@ -109,7 +117,7 @@ impl GitignoreMatcher {
     /// Like `new`, but might mark the subtree as "ignored" entirely.
     /// Used internally by `match_subdir_path`.
     fn new_with_rootmatcher(dir: &Path, root: &GitignoreMatcher) -> Self {
-        let dir_root_relative = dir.strip_prefix(root.ignore.path()).unwrap();
+        let dir_root_relative = dir.strip_prefix(&root.dir).unwrap();
         let submatchers = RwLock::new(HashMap::new());
         let (ignored, ignore) = if root.match_relative(dir_root_relative, true) {
             (true, gitignore::Gitignore::empty())
@@ -127,6 +135,7 @@ impl GitignoreMatcher {
         };
         GitignoreMatcher {
             ignore,
+            dir: dir.to_path_buf(),
             ignored,
             submatchers,
             case_sensitive: root.case_sensitive,
@@ -200,7 +209,7 @@ impl GitignoreMatcher {
             }
         }
         {
-            let dir = self.ignore.path().join(name);
+            let dir = self.dir.join(name);
             if dir.is_dir() {
                 let m = GitignoreMatcher::new_with_rootmatcher(&dir, root);
                 let result = m.match_path(rest, is_dir, root, explain);
@@ -290,7 +299,7 @@ impl Explain {
 
             let from = match glob.from() {
                 Some(path) => {
-                    let path = path.strip_prefix(root.ignore.path()).unwrap_or(path);
+                    let path = path.strip_prefix(&root.dir).unwrap_or(path);
                     format!("from {}", path.to_string_lossy())
                 }
                 None => String::new(),
@@ -381,6 +390,29 @@ mod tests {
         assert_eq!(
             m.explain("x/DIR/bar/baz", true),
             "x/DIR/bar/baz: not ignored\n"
+        );
+    }
+
+    #[test]
+    fn test_gitignore_below_directories_without_one() {
+        let dir = tempdir().unwrap();
+        create_dir_all(dir.path().join("x/y")).expect("mkdir");
+        create_dir_all(dir.path().join("n/n/n")).expect("mkdir");
+        write(dir.path().join("x/y/.gitignore"), b"*.log\n");
+        write(dir.path().join("n/n/n/.gitignore"), b"*.tmp\n");
+
+        // Neither the root nor x nor n has a .gitignore, so their matchers
+        // have no rules; the .gitignore files below them still apply.
+        let m = GitignoreMatcher::new(dir.path(), Vec::new(), true);
+        assert!(m.match_relative("x/y/a.log", false));
+        assert!(m.match_relative("n/n/n/a.tmp", false));
+        assert!(!m.match_relative("n/n/file", false));
+        assert_eq!(
+            m.explain("x/y/a.log", false),
+            format!(
+                "x/y/a.log: ignored by rule *.log from {}\n",
+                Path::new("x/y/.gitignore").display()
+            )
         );
     }
 
