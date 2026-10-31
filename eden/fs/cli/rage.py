@@ -702,6 +702,15 @@ def paste_output(
             "Skipping generation of external paste output due `--dry-run` mode being used. Re-run without `--dry-run` to generate this section.\n"
         )
         return 0
+    if not processor:
+        # Without a rage.reporter to paste with, as in open-source builds,
+        # the section goes into the report itself.
+        try:
+            output_generator(out)
+        except Exception as e:
+            out.write(f"Error generating output: {e}\n")
+            return 1
+        return 0
     try:
         proc = subprocess.Popen(
             shlex.split(processor), stdin=subprocess.PIPE, stdout=subprocess.PIPE
