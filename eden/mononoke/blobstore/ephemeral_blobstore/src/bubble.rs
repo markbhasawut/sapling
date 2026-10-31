@@ -140,6 +140,12 @@ impl TryFrom<Value> for BubbleId {
         match v {
             Value::UInt(id) => from_u64(id, v),
             Value::Int(id) => from_u64(id as u64, v),
+            // MySQL's text protocol, which open-source builds use, returns
+            // every value as its decimal text.
+            Value::Bytes(ref bytes) => match std::str::from_utf8(bytes).map(str::parse::<u64>) {
+                Ok(Ok(id)) => from_u64(id, v),
+                _ => Err(FromValueError(v)),
+            },
             v => Err(FromValueError(v)),
         }
     }
@@ -233,6 +239,10 @@ impl TryFrom<Value> for ExpiryStatus {
         match v {
             Value::Int(1) => Ok(ExpiryStatus::Expired),
             Value::Int(0) => Ok(ExpiryStatus::Active),
+            // MySQL's text protocol, which open-source builds use, returns
+            // the column as text.
+            Value::Bytes(ref b) if b == b"1" => Ok(ExpiryStatus::Expired),
+            Value::Bytes(ref b) if b == b"0" => Ok(ExpiryStatus::Active),
             v => Err(FromValueError(v)),
         }
     }
@@ -647,5 +657,40 @@ impl Bubble {
     ) -> Result<BlobstoreIsPresent> {
         self.check_unexpired().await?;
         self.blobstore.is_present(ctx, key).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use mononoke_macros::mononoke;
+    use sql::mysql_async::from_value_opt;
+
+    use super::*;
+
+    #[mononoke::test]
+    fn bubble_id_from_mysql_values() {
+        let id = |v: Value| from_value_opt::<BubbleId>(v).ok().map(i64::from);
+        assert_eq!(id(Value::UInt(7)), Some(7));
+        assert_eq!(id(Value::Int(7)), Some(7));
+        // MySQL's text protocol returns ids as decimal text.
+        assert_eq!(id(Value::Bytes(b"7".to_vec())), Some(7));
+        assert_eq!(id(Value::Bytes(b"0".to_vec())), None);
+        assert_eq!(id(Value::Bytes(b"x".to_vec())), None);
+    }
+
+    #[mononoke::test]
+    fn expiry_status_from_mysql_values() {
+        let status = |v: Value| from_value_opt::<ExpiryStatus>(v).ok();
+        assert_eq!(status(Value::Int(1)), Some(ExpiryStatus::Expired));
+        assert_eq!(status(Value::Int(0)), Some(ExpiryStatus::Active));
+        assert_eq!(
+            status(Value::Bytes(b"1".to_vec())),
+            Some(ExpiryStatus::Expired)
+        );
+        assert_eq!(
+            status(Value::Bytes(b"0".to_vec())),
+            Some(ExpiryStatus::Active)
+        );
+        assert_eq!(status(Value::Bytes(b"2".to_vec())), None);
     }
 }
