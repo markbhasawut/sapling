@@ -72,6 +72,18 @@ class StaleMountsCheckTest(DoctorTestBase):
         self.assertEqual([], self.mount_table.unmount_force_calls)
 
     @patch("eden.fs.cli.doctor.check_stale_mounts.get_sudo_perms")
+    def test_no_sudo_check_without_stale_mounts(
+        self, mock_get_sudo_perms: MagicMock
+    ) -> None:
+        # `sudo -l` may prompt for a password, so it is only run when there
+        # is a stale mount to unmount.
+        self.mount_table.add_mount("/mnt/other1")
+        fixer, out = self.run_check(dry_run=False)
+        self.assertEqual("", out)
+        self.assert_results(fixer, num_problems=0)
+        mock_get_sudo_perms.assert_not_called()
+
+    @patch("eden.fs.cli.doctor.check_stale_mounts.get_sudo_perms")
     def test_force_unmounts_if_lazy_fails(self, mock_get_sudo_perms: MagicMock) -> None:
         mock_get_sudo_perms.return_value = True
         self.mount_table.add_stale_mount("/mnt/stale1")

@@ -28,7 +28,6 @@ def check_for_stale_mounts(
     mount_table: mtab.MountTable,
     instance: Optional[Any] = None,
 ) -> None:
-    sudo_perms = get_sudo_perms()
     [stale_mounts, hanging_mounts, unknown_status_mounts] = (
         get_all_stale_eden_mount_points(mount_table)
     )
@@ -36,7 +35,10 @@ def check_for_stale_mounts(
         _log_mount_health_issues(instance, stale_mounts, "stale_mount")
         _log_mount_health_issues(instance, hanging_mounts, "hanging_mount")
     if stale_mounts:
-        tracker.add_problem(StaleMountsFound(stale_mounts, mount_table, sudo_perms))
+        # Only now, as `sudo -l` may prompt for a password.
+        tracker.add_problem(
+            StaleMountsFound(stale_mounts, mount_table, get_sudo_perms())
+        )
     if hanging_mounts:
         tracker.add_problem(HangingMountFound(hanging_mounts))
 
