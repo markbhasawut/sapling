@@ -55,6 +55,7 @@ rust_library(
         "//eden/mononoke/repo_attributes/repo_derived_data:repo_derived_data",
         "//eden/mononoke/repo_attributes/repo_identity:repo_identity",
         "//eden/mononoke/repo_attributes/restricted_paths:restricted_paths",
+        "//eden/mononoke/repo_authorization:repo_authorization",
         "//eden/mononoke/repo_client:getbundle_response",
         "//eden/mononoke/repo_client:remotefilelog",
         "//eden/mononoke/repo_client:repo_client",
