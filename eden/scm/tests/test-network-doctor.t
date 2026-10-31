@@ -120,3 +120,16 @@ Servers without the route answer 404.
   No network problems detected.
 
   $ $PYTHON $TESTDIR/killdaemons.py $DAEMON_PIDS
+
+A repo with no server, made with init or cloned from a local path, has no
+network to check:
+
+  $ sl debugnetworkdoctor --config paths.default= --config edenapi.url=
+  No server configured for this repo: there is no network to check.
+  $ sl debugnetworkdoctor --config paths.default=$TESTTMP/elsewhere --config edenapi.url=
+  No server configured for this repo: there is no network to check.
+
+A server without edenapi.url is still a configuration problem:
+
+  $ sl debugnetworkdoctor --config edenapi.url= | head -1
+  Invalid config: no config for edenapi.url
