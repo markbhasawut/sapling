@@ -1,5 +1,6 @@
 load("@fbcode_macros//build_defs/lib:rust_oss.bzl", "rust_oss")
 load("@fbsource//tools/build_defs:rust_library.bzl", "rust_library")
+load("@fbsource//tools/build_defs:rust_unittest.bzl", "rust_unittest")
 
 oncall("scm_server_infra")
 
@@ -88,6 +89,24 @@ rust_library(
     )
     + [
         "//dba/myadmin/if:if-myadmin-rust-clients",
+    ],
+)
+
+rust_unittest(
+    name = "sql_ext_oss_metrics_test",
+    srcs = glob(["test/**/*.rs"]),
+    crate = "sql_ext_oss_metrics_test",
+    crate_root = "test/oss_metrics.rs",
+    deps = [
+        "fbsource//third-party/rust:anyhow",
+        "fbsource//third-party/rust:tokio",
+        ":sql_ext",
+        "//common/rust/shed/fbinit:fbinit",
+        "//common/rust/shed/sql:sql",
+        "//common/rust/shed/sql:sql_common",
+        "//common/rust/shed/stats:stats",
+        "//eden/mononoke/common/metadata:metadata",
+        "//eden/mononoke/common/mononoke_macros:mononoke_macros",
     ],
 )
 

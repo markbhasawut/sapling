@@ -28,6 +28,7 @@ mod lab;
 pub(crate) mod probe;
 pub(crate) mod retry;
 pub(crate) mod secrets;
+pub(crate) mod status;
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -77,6 +78,7 @@ use self::probe::ProbeTransport;
 use self::probe::Prober;
 use self::probe::Refresher;
 use self::secrets::Credentials;
+use self::status::RoundStatus;
 use crate::Connection;
 use crate::SqlConnections;
 use crate::facebook::MysqlOptions;
@@ -384,6 +386,9 @@ struct PoolEndpoint {
 
 /// The servers of one cluster, its pools, and its prober.
 pub struct Cluster {
+    /// Unique in this process.
+    id: u64,
+    key: ClusterKey,
     /// The hosts file or the candidates, for logs.
     name: String,
     mode: PrimaryCheck,
@@ -400,6 +405,9 @@ pub struct Cluster {
     /// pools, as their errors give them.
     write_refusals: Arc<Mutex<HashSet<Arc<str>>>>,
     shared: Mutex<Shared>,
+    /// What the last probe round found, for [`Cluster::status`]. `None` in
+    /// none mode and before the first round ends.
+    round: Mutex<Option<RoundStatus>>,
     /// The prober, or in none mode the refresher.
     prober: Mutex<Option<JoinHandle<()>>>,
 }
@@ -411,6 +419,8 @@ struct Shared {
     primary: Result<PoolEndpoint, String>,
     /// Where the Read pools point, or why they are unavailable.
     read: Result<PoolEndpoint, String>,
+    /// Times `primary` was repointed or made unavailable.
+    primary_generation: u64,
     pools: HashMap<(String, Role), OssPool>,
 }
 
@@ -488,6 +498,8 @@ impl Cluster {
             }
         };
         let cluster = Arc::new(Cluster {
+            id: status::next_cluster_id(),
+            key: ClusterKey::of(target),
             name,
             mode,
             user_secret: target.user_secret.clone(),
@@ -501,10 +513,13 @@ impl Cluster {
                 credentials,
                 primary,
                 read,
+                primary_generation: 0,
                 pools: HashMap::new(),
             }),
+            round: Mutex::new(None),
             prober: Mutex::new(None),
         });
+        status::register(&cluster);
         if mode == PrimaryCheck::None {
             let refresher = Refresher::new(
                 Arc::downgrade(&cluster),
@@ -707,6 +722,9 @@ impl Cluster {
                 }
             }
         }
+        if primary_changed {
+            shared.primary_generation += 1;
+        }
         self.update_pools(shared, primary_changed, read_changed, rebuild);
         // A reason given by an action is more precise.
         if !primary_changed
@@ -739,6 +757,7 @@ impl Cluster {
                 );
                 shared.primary = Ok(endpoint.clone());
                 shared.read = Ok(endpoint);
+                shared.primary_generation += 1;
                 changed = true;
             }
         }

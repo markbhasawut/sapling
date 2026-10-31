@@ -52,6 +52,8 @@ use mononoke_macros::mononoke;
 use openssl::ssl::Ssl;
 use openssl::ssl::SslAcceptor;
 use permission_checker::AclProvider;
+#[cfg(not(fbcode_build))]
+use permission_checker::ArcMembershipChecker;
 use permission_checker::MononokeIdentity;
 use permission_checker::MononokeIdentitySet;
 use qps::Qps;
@@ -133,6 +135,7 @@ pub async fn connection_acceptor(
     acl_provider: &dyn AclProvider,
     readonly: bool,
     mtls_disabled: bool,
+    #[cfg(not(fbcode_build))] admin_group: ArcMembershipChecker,
 ) -> Result<()> {
     let enable_http_control_api = common_config.enable_http_control_api;
 
@@ -183,6 +186,8 @@ pub async fn connection_acceptor(
         common_config,
         readonly,
         mtls_disabled,
+        #[cfg(not(fbcode_build))]
+        admin_group,
     });
 
     loop {
@@ -238,6 +243,9 @@ pub struct Acceptor<R> {
     pub common_config: CommonConfig,
     pub readonly: bool,
     pub mtls_disabled: bool,
+    /// Who may read `/metrics`.
+    #[cfg(not(fbcode_build))]
+    pub admin_group: ArcMembershipChecker,
 }
 
 /// Details for a socket we've just opened.

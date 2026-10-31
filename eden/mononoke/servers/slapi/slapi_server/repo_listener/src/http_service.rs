@@ -217,6 +217,11 @@ where
             return Ok(res);
         }
 
+        #[cfg(not(fbcode_build))]
+        if req.uri().path() == "/metrics" {
+            return self.handle_metrics_request(req.method()).await;
+        }
+
         if is_websocket_req(self.conn.is_h2, &req)? {
             return self.handle_websocket_request(req).await;
         }
@@ -406,6 +411,44 @@ where
         }
 
         Err(HttpError::NotFound)
+    }
+
+    /// The in-memory stats in the Prometheus text format, for the admin
+    /// group only. The identities checked are those of the connection: a
+    /// trusted proxy is judged by its own certificate.
+    #[cfg(not(fbcode_build))]
+    async fn handle_metrics_request(
+        &self,
+        method: &Method,
+    ) -> Result<Response<UnsyncBoxBody<Bytes, io::Error>>, HttpError> {
+        if method != Method::GET {
+            return Err(HttpError::MethodNotAllowed);
+        }
+
+        if !self
+            .acceptor()
+            .admin_group
+            .is_member(&self.conn.identities)
+            .await
+        {
+            return Err(HttpError::Forbidden);
+        }
+
+        let snapshot = stats::memory_stats::snapshot().ok_or_else(|| {
+            HttpError::internal(anyhow!("the in-memory stats backend is not installed"))
+        })?;
+        let body = slapi_service::server_health::render_prometheus(&snapshot);
+
+        Response::builder()
+            .status(http::StatusCode::OK)
+            .header(
+                http::header::CONTENT_TYPE,
+                slapi_service::server_health::PROMETHEUS_CONTENT_TYPE,
+            )
+            .body(UnsyncBoxBody::new(
+                Full::new(Bytes::from(body)).map_err(|never| match never {}),
+            ))
+            .map_err(HttpError::internal)
     }
 
     async fn handle_eden_api_request(

@@ -32,6 +32,8 @@ use mononoke_app::monitoring::ReadyFlagService;
 use ods_counters::OdsCounterManager;
 use openssl::ssl::SslAcceptor;
 use permission_checker::AclProvider;
+#[cfg(not(fbcode_build))]
+use permission_checker::ArcMembershipChecker;
 use rate_limiting::RateLimitEnvironment;
 use scribe_ext::Scribe;
 use scuba_ext::MononokeScubaSampleBuilder;
@@ -78,6 +80,15 @@ pub async fn create_repo_listeners<'a>(
         })
     };
 
+    // Who may see the details of server health reports and read /metrics.
+    #[cfg(not(fbcode_build))]
+    let admin_group: ArcMembershipChecker = Arc::from(
+        acl_provider
+            .admin_group()
+            .await
+            .context("Error loading the admin group")?,
+    );
+
     let edenapi = {
         let mut scuba = scuba.clone();
         scuba.add("service", "edenapi");
@@ -98,6 +109,8 @@ pub async fn create_repo_listeners<'a>(
             tls_ca_path,
             rim_backend,
             rim_regional_resources,
+            #[cfg(not(fbcode_build))]
+            admin_group.clone(),
         )
         .context("Error instantiating SaplingRemoteAPI")?
     };
@@ -125,6 +138,8 @@ pub async fn create_repo_listeners<'a>(
         acl_provider,
         readonly,
         mtls_disabled,
+        #[cfg(not(fbcode_build))]
+        admin_group,
     )
     .await
 }
