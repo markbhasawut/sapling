@@ -132,6 +132,11 @@ def fmtProblemMessage(
     return f"{description}\nStdout:\n{fmtExcMsg(ex.stdout)}\nStderr:\n{fmtExcMsg(ex.stderr)}\n"
 
 
+# What 'sl debugnetworkdoctor' prints, with exit code 0, for a repo that has no
+# server to check.
+NO_SERVER_MESSAGE = "No server configured for this repo"
+
+
 class NetworkChecker:
     def run_command(
         self, args: List[str], cwd: Path
@@ -161,7 +166,9 @@ class NetworkChecker:
         checked_network_backing_repos.add(str(checkout_backing_repo))
         hg = os.environ.get("EDEN_HG_BINARY", "hg")
         try:
-            self.run_command([hg, "debugnetworkdoctor"], checkout_backing_repo)
+            result = self.run_command(
+                [hg, "debugnetworkdoctor"], checkout_backing_repo
+            )
         except subprocess.CalledProcessError as ex:
             server_health_problem = parse_server_health(ex.stdout)
             if server_health_problem is not None:
@@ -181,6 +188,11 @@ class NetworkChecker:
                     fmtProblemMessage("command 'sl debugnetworkdoctor' timed out:", ex)
                 )
             )
+            return
+
+        # A repo made with init or cloned from a local path has no server, and
+        # 'sl debugnetwork' would only try to reach "default" on this machine.
+        if result.stdout.startswith(NO_SERVER_MESSAGE):
             return
 
         if run_repo_checks:
