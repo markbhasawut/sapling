@@ -7,6 +7,10 @@ authors = ["Facebook"]
 edition = "2024"
 license = "GPLv2+"
 
+[[bin]]
+name = "fileblob_layout"
+path = "src/bin/fileblob_layout.rs"
+
 [dependencies]
 anyhow = "1.0.104"
 async-trait = "0.1.92"

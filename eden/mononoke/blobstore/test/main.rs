@@ -241,6 +241,19 @@ blobstore_test_impl! {
 }
 
 blobstore_test_impl! {
+    fileblob_sharded_test => {
+        state: {
+            let dir = TempDir::with_prefix("fileblob_sharded_test.").unwrap();
+            fileblob::migrate(dir.path(), fileblob::Layout::Sharded, 1, |_| {}).unwrap();
+            Arc::new(dir)
+        },
+        new: move |dir: Arc<TempDir>, put_behaviour,| Fileblob::open(&*dir, put_behaviour),
+        persistent: true,
+        has_ctime: true,
+    }
+}
+
+blobstore_test_impl! {
     sqlblob_test_no_inline => {
         state: (),
         new: move |_, put_behaviour,| Sqlblob::with_sqlite_in_memory(put_behaviour, &(get_test_config_store().1), false, 0),
