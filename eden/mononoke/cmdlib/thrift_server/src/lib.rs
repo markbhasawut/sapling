@@ -8,9 +8,8 @@
 //! Thrift server builder shared by Mononoke's services.
 //!
 //! fbcode builds serve through srserver and ServiceFramework. OSS builds
-//! serve through the loopback-only `oss_thrift_transport`, a reference
-//! transport for local development, testing and demonstration that is not
-//! suitable for deployment.
+//! serve through `oss_thrift_transport`: mutual TLS 1.3 on any address when
+//! given certificates, and otherwise plaintext on loopback addresses only.
 
 mod config;
 
@@ -30,10 +29,14 @@ use facebook as platform;
 #[cfg(not(fbcode_build))]
 use oss as platform;
 pub use platform::DEFAULT_THRIFT_HOST;
+#[cfg(not(fbcode_build))]
+pub use platform::Limits;
 pub use platform::MononokeThriftServer;
 pub use platform::RequestContext;
 #[cfg(fbcode_build)]
 pub use platform::ServiceMetadata;
+#[cfg(not(fbcode_build))]
+pub use platform::ServerTls;
 pub use platform::ThriftServerBuilder;
 pub use platform::ThriftServerShutdownHandle;
 
