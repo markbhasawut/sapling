@@ -92,6 +92,11 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
         .with_tls()
         .with_cancel_on_client_disconnect()
         .factory(exec, move || service);
+    #[cfg(not(fbcode_build))]
+    let builder = match &args.platform.tls_args {
+        Some(tls_args) => builder.with_tls_args(tls_args)?,
+        None => builder,
+    };
     let mut server = platform::configure_server(builder, &app).build()?;
 
     info!("Listening on {}", server.bound_address()?);

@@ -53,6 +53,12 @@ const SM_CLEANUP_TIMEOUT_SECS: u64 = 60;
 struct MononokeBookmarkServiceArgs {
     #[clap(flatten)]
     shutdown_timeout_args: ShutdownTimeoutArgs,
+    /// Serve mutual TLS. TLSArgs' fields are required once any is given,
+    /// so it is optional as a whole: without it, the server serves
+    /// plaintext on loopback.
+    #[cfg(not(fbcode_build))]
+    #[clap(flatten)]
+    tls_args: Option<mononoke_app::args::TLSArgs>,
     /// Thrift host
     #[clap(long, short = 'H', default_value = DEFAULT_THRIFT_HOST)]
     host: String,
@@ -183,6 +189,11 @@ fn main(fb: FacebookInit) -> Result<()> {
         .port(port)
         .with_handle(exec.clone())
         .factory(exec, move || service);
+    #[cfg(not(fbcode_build))]
+    let builder = match &args.tls_args {
+        Some(tls_args) => builder.with_tls_args(tls_args)?,
+        None => builder,
+    };
     let mut server = platform::configure_server(builder, &app).build()?;
 
     // Write out the bound address if requested, this is helpful in tests when using automatic binding with :0

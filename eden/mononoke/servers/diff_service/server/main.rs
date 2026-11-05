@@ -52,6 +52,12 @@ const SM_CLEANUP_TIMEOUT_SECS: u64 = 60;
 struct DiffServiceArgs {
     #[clap(flatten)]
     shutdown_timeout_args: ShutdownTimeoutArgs,
+    /// Serve mutual TLS. TLSArgs' fields are required once any is given,
+    /// so it is optional as a whole: without it, the server serves
+    /// plaintext on loopback.
+    #[cfg(not(fbcode_build))]
+    #[clap(flatten)]
+    tls_args: Option<mononoke_app::args::TLSArgs>,
     #[clap(long, short = 'H', default_value = DEFAULT_THRIFT_HOST)]
     host: String,
     #[clap(long, short, default_value_t = 8999)]
@@ -190,6 +196,11 @@ fn main(fb: FacebookInit) -> Result<()> {
         .port(port)
         .with_handle(runtime.clone())
         .factory(thrift_factory.executor(), move || service);
+    #[cfg(not(fbcode_build))]
+    let builder = match &args.tls_args {
+        Some(tls_args) => builder.with_tls_args(tls_args)?,
+        None => builder,
+    };
     let mut server = platform::configure_server(builder, &app).build()?;
 
     if let Some(bound_addr_path) = &args.bound_address_file {

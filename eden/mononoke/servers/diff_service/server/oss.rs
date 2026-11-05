@@ -32,19 +32,33 @@ impl ServiceState {
         Ok(())
     }
 
+    /// Metadata for a request: the identities in the caller's TLS
+    /// certificate, or `OSS_LOCAL` for a caller over plaintext loopback.
     pub(crate) async fn create_metadata(
         &self,
-        _req_ctxt: &RequestContext,
+        req_ctxt: &RequestContext,
     ) -> Result<Metadata, ServerError> {
-        let identities = [MononokeIdentity::oss_local()].into_iter().collect();
-        Ok(Metadata::new(None, identities, false, false, None, None).await)
+        let identities = req_ctxt
+            .identities()
+            .cloned()
+            .unwrap_or_else(|| [MononokeIdentity::oss_local()].into_iter().collect());
+        let peer = req_ctxt.peer_addr();
+        Ok(Metadata::new(
+            None,
+            identities,
+            false,
+            false,
+            peer.map(|peer| peer.ip()),
+            peer.map(|peer| peer.port()),
+        )
+        .await)
     }
 }
 
-/// The OSS transport cannot authenticate callers, so requests are not
-/// subject to access control.
-pub(crate) fn authorization_context(_ctx: &CoreContext) -> AuthorizationContext {
-    AuthorizationContext::new_oss_local()
+/// Callers with TLS certificates are subject to the repos' ACLs, as SLAPI's
+/// are; callers over plaintext loopback are not.
+pub(crate) fn authorization_context(ctx: &CoreContext) -> AuthorizationContext {
+    AuthorizationContext::new_oss(ctx)
 }
 
 pub(crate) fn set_nocache_header(_req_ctxt: &RequestContext) {}
@@ -78,13 +92,39 @@ mod tests {
 
     use super::*;
 
+    async fn ctx_for(fb: FacebookInit, req_ctxt: &RequestContext) -> CoreContext {
+        let metadata = ServiceState
+            .create_metadata(req_ctxt)
+            .await
+            .expect("OSS request metadata should be created");
+        context::SessionContainer::builder(fb)
+            .metadata(std::sync::Arc::new(metadata))
+            .build()
+            .new_context(CoreContext::test_mock(fb).scuba().clone())
+    }
+
     #[mononoke::fbinit_test]
-    fn requests_are_not_subject_to_access_control(fb: FacebookInit) {
-        let ctx = CoreContext::test_mock(fb);
+    async fn loopback_requests_are_not_subject_to_access_control(fb: FacebookInit) {
+        let ctx = ctx_for(fb, &RequestContext::new()).await;
         assert_eq!(
             authorization_context(&ctx),
             AuthorizationContext::new_oss_local()
         );
+    }
+
+    #[mononoke::fbinit_test]
+    async fn tls_requests_are_subject_to_access_control(fb: FacebookInit) {
+        let identities = [MononokeIdentity::from_legacy_type_data("USER", "alice")];
+        let req_ctxt = RequestContext::for_peer(
+            "192.0.2.1:4000".parse().unwrap(),
+            Some(identities.into_iter().collect()),
+        );
+        let ctx = ctx_for(fb, &req_ctxt).await;
+        assert_eq!(
+            ctx.metadata().identities(),
+            req_ctxt.identities().expect("the context has identities")
+        );
+        assert_eq!(authorization_context(&ctx), AuthorizationContext::new(&ctx));
     }
 
     #[mononoke::test]

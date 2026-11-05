@@ -63,6 +63,12 @@ const SM_CLEANUP_TIMEOUT_SECS: u64 = 60;
 struct ScsServerArgs {
     #[clap(flatten)]
     shutdown_timeout_args: ShutdownTimeoutArgs,
+    /// Serve mutual TLS. TLSArgs' fields are required once any is given,
+    /// so it is optional as a whole: without it, the server serves
+    /// plaintext on loopback.
+    #[cfg(not(fbcode_build))]
+    #[clap(flatten)]
+    tls_args: Option<mononoke_app::args::TLSArgs>,
     #[clap(flatten)]
     scribe_logging_args: ScribeLoggingArgs,
     /// Enable trace logging of dependencies
@@ -308,6 +314,11 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
             counters_update_interval: Duration::from_millis(100),
             cgroup_root_path: "/cgroup2".to_string(),
         });
+    #[cfg(not(fbcode_build))]
+    let builder = match &args.tls_args {
+        Some(tls_args) => builder.with_tls_args(tls_args)?,
+        None => builder,
+    };
     let mut server = platform::configure_server(builder, &app)
         .factory(factory.executor(), move || service)
         .build()?;
