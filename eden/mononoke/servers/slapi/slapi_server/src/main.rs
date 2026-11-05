@@ -94,6 +94,13 @@ struct MononokeServerArgs {
     /// Path to a file with land service client private key
     #[clap(long, requires = "land_service_client_cert")]
     land_service_client_private_key: Option<String>,
+    /// Reach the land service over mutual TLS with
+    /// --land-service-client-cert, --land-service-client-private-key and
+    /// --tls-ca. Without it, OSS builds reach the land service over
+    /// plaintext, on loopback only, as before.
+    #[cfg(not(fbcode_build))]
+    #[clap(long, requires = "land_service_client_private_key")]
+    land_service_tls: bool,
     /// Configerator path to the MononokeRateLimits config to load
     #[clap(long, default_value = "scm/mononoke/ratelimiting/ratelimits")]
     rate_limit_config_path: Option<String>,
@@ -262,6 +269,20 @@ fn main(fb: FacebookInit) -> Result<()> {
 
     #[cfg(fbcode_build)]
     if let (Some(land_service_cert_path), Some(land_service_key_path)) = (
+        &args.land_service_client_cert,
+        &args.land_service_client_private_key,
+    ) {
+        pushrebase_client::land_service_override_certificate_paths(
+            land_service_cert_path,
+            land_service_key_path,
+            &args.tls_args.tls_ca,
+        );
+    }
+    // OSS test setups pass the certificate flags to a plaintext land service,
+    // so they only turn TLS on with --land-service-tls.
+    #[cfg(not(fbcode_build))]
+    if let (true, Some(land_service_cert_path), Some(land_service_key_path)) = (
+        args.land_service_tls,
         &args.land_service_client_cert,
         &args.land_service_client_private_key,
     ) {

@@ -26,6 +26,8 @@ use context::CoreContext;
 use facebook as platform;
 #[cfg(fbcode_build)]
 pub use facebook::override_certificate_paths as land_service_override_certificate_paths;
+#[cfg(not(fbcode_build))]
+pub use oss::override_certificate_paths as land_service_override_certificate_paths;
 use hooks::CrossRepoPushSource;
 pub use hybrid::normal_pushrebase;
 pub use land_service::LandServicePushrebaseClient;
