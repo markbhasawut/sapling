@@ -7,6 +7,7 @@
 
 use clap::Args;
 use context::CoreContext;
+use mononoke_app::args::TLSArgs;
 use metadata::Metadata;
 use mononoke_app::MononokeApp;
 use mononoke_thrift_server::RequestContext;
@@ -18,7 +19,13 @@ use scuba_ext::MononokeScubaSampleBuilder;
 use crate::errors::LandChangesetsError;
 
 #[derive(Debug, Args)]
-pub(crate) struct ServerArgs {}
+pub(crate) struct ServerArgs {
+    /// Serve mutual TLS. TLSArgs' fields are required once any is given,
+    /// so it is optional as a whole: without it, the server serves
+    /// plaintext on loopback.
+    #[clap(flatten)]
+    pub(crate) tls_args: Option<TLSArgs>,
+}
 
 #[derive(Clone)]
 pub(crate) struct ServiceState;
@@ -43,12 +50,26 @@ impl ServiceState {
         Ok(())
     }
 
+    /// Metadata for a request: the identities in the caller's TLS
+    /// certificate, or `OSS_LOCAL` for a caller over plaintext loopback.
     pub(crate) async fn create_metadata(
         &self,
-        _req_ctxt: &RequestContext,
+        req_ctxt: &RequestContext,
     ) -> Result<Metadata, LandChangesetsError> {
-        let identities = [MononokeIdentity::oss_local()].into_iter().collect();
-        Ok(Metadata::new(None, identities, false, false, None, None).await)
+        let identities = req_ctxt
+            .identities()
+            .cloned()
+            .unwrap_or_else(|| [MononokeIdentity::oss_local()].into_iter().collect());
+        let peer = req_ctxt.peer_addr();
+        Ok(Metadata::new(
+            None,
+            identities,
+            false,
+            false,
+            peer.map(|peer| peer.ip()),
+            peer.map(|peer| peer.port()),
+        )
+        .await)
     }
 }
 
@@ -59,19 +80,26 @@ pub(crate) fn configure_server(
     builder
 }
 
-/// The OSS transport cannot authenticate callers, so requests are not
-/// subject to access control, and requests that name a service identity for
-/// service writes are refused.
+/// Callers with TLS certificates are subject to the repos' ACLs, as SLAPI's
+/// are, and may act as a service if its ACL allows them, which each write
+/// checks. Callers over plaintext loopback are not subject to ACLs, and
+/// can't be identified, so their requests naming a service are refused.
 pub(crate) fn authorization_context(
-    _ctx: &CoreContext,
+    ctx: &CoreContext,
     service_identity: Option<String>,
 ) -> Result<AuthorizationContext, LandChangesetsError> {
-    if service_identity.is_some() {
-        return Err(LandChangesetsError::AuthorizationError(
-            "service_identity is not accepted by OSS builds".to_string(),
-        ));
+    let authz = AuthorizationContext::new_oss(ctx);
+    match service_identity {
+        None => Ok(authz),
+        Some(_) if authz == AuthorizationContext::new_oss_local() => {
+            Err(LandChangesetsError::AuthorizationError(
+                "service_identity needs a TLS client certificate in OSS builds".to_string(),
+            ))
+        }
+        Some(service_identity) => Ok(AuthorizationContext::new_for_service_writes(
+            service_identity,
+        )),
     }
-    Ok(AuthorizationContext::new_oss_local())
 }
 
 #[cfg(test)]
@@ -81,9 +109,19 @@ mod tests {
 
     use super::*;
 
+    async fn ctx_for(fb: FacebookInit, req_ctxt: &RequestContext) -> CoreContext {
+        let Ok(metadata) = ServiceState.create_metadata(req_ctxt).await else {
+            panic!("OSS request metadata should be created");
+        };
+        context::SessionContainer::builder(fb)
+            .metadata(std::sync::Arc::new(metadata))
+            .build()
+            .new_context(CoreContext::test_mock(fb).scuba().clone())
+    }
+
     #[mononoke::fbinit_test]
-    fn requests_are_not_subject_to_access_control(fb: FacebookInit) {
-        let ctx = CoreContext::test_mock(fb);
+    async fn loopback_requests_are_not_subject_to_access_control(fb: FacebookInit) {
+        let ctx = ctx_for(fb, &RequestContext::new()).await;
         let Ok(authz) = authorization_context(&ctx, None) else {
             panic!("a request without a service identity should be accepted");
         };
@@ -91,9 +129,30 @@ mod tests {
     }
 
     #[mononoke::fbinit_test]
-    fn requests_naming_a_service_are_refused(fb: FacebookInit) {
-        let ctx = CoreContext::test_mock(fb);
+    async fn loopback_requests_naming_a_service_are_refused(fb: FacebookInit) {
+        let ctx = ctx_for(fb, &RequestContext::new()).await;
         assert!(authorization_context(&ctx, Some("some_service".to_string())).is_err());
+    }
+
+    #[mononoke::fbinit_test]
+    async fn tls_requests_are_subject_to_access_control(fb: FacebookInit) {
+        let identities = [MononokeIdentity::from_legacy_type_data("USER", "alice")];
+        let req_ctxt = RequestContext::for_peer(
+            "192.0.2.1:4000".parse().unwrap(),
+            Some(identities.into_iter().collect()),
+        );
+        let ctx = ctx_for(fb, &req_ctxt).await;
+        let Ok(authz) = authorization_context(&ctx, None) else {
+            panic!("a TLS request should be accepted");
+        };
+        assert_eq!(authz, AuthorizationContext::new(&ctx));
+        let Ok(service) = authorization_context(&ctx, Some("some_service".to_string())) else {
+            panic!("a TLS caller may ask to act as a service");
+        };
+        assert_eq!(
+            service,
+            AuthorizationContext::new_for_service_writes("some_service")
+        );
     }
 
     #[mononoke::test]

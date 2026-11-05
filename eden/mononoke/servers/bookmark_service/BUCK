@@ -3,11 +3,24 @@ load("@fbsource//tools/build_defs:rust_binary.bzl", "rust_binary")
 
 oncall("scm_server_infra")
 
+OSS_DEPS = [
+    "//eden/mononoke/common/permission_checker:permission_checker",
+]
+
 rust_binary(
     name = "bookmark_service_server",
     srcs = glob([
         "server/**/*.rs",
     ]),
+    autocargo = {
+        "cargo_toml_config": {
+            # Autocargo reads this file as an fbcode build, so it does not
+            # see the OSS backend's dependencies.
+            "extra_buck_dependencies": {
+                "dependencies": OSS_DEPS,
+            },
+        },
+    },
     test_deps = [
         "//common/rust/shed/fbinit:fbinit-tokio",
         "//eden/mononoke/cmdlib/mononoke_app:mononoke_app",
@@ -59,7 +72,7 @@ rust_binary(
         "//eden/mononoke/servers/slapi/slapi_server/context:context",
     ]
     + (
-        []
+        OSS_DEPS
         if rust_oss.is_oss_build()
         else [
             "fbsource//third-party/rust:serde_json",

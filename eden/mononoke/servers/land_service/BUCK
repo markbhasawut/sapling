@@ -18,6 +18,7 @@ rust_binary(
         },
     },
     test_deps = [
+        "//common/rust/shed/fbinit:fbinit-tokio",
         "//eden/mononoke/common/rust/justknobs_ext:justknobs",
     ]
     + (["//eden/mononoke/common/mononoke_macros:mononoke_macros"] if rust_oss.is_oss_build() else []),

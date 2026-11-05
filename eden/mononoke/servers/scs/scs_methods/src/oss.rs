@@ -57,39 +57,59 @@ impl RequestState {
         Ok(())
     }
 
+    /// Metadata for a request: the identities in the caller's TLS
+    /// certificate, or `OSS_LOCAL` for a caller over plaintext loopback.
     pub(crate) async fn create_metadata(
         &self,
-        _req_ctxt: &RequestContext,
+        req_ctxt: &RequestContext,
     ) -> Result<Metadata, scs_errors::ServiceError> {
         let client_info = clientinfo::ClientInfo::default_with_entry_point(
             clientinfo::ClientEntryPoint::ScsServer,
         );
-        let identities = [MononokeIdentity::oss_local()].into_iter().collect();
-        let mut metadata = Metadata::new(None, identities, false, false, None, None).await;
+        let identities = req_ctxt
+            .identities()
+            .cloned()
+            .unwrap_or_else(|| [MononokeIdentity::oss_local()].into_iter().collect());
+        let peer = req_ctxt.peer_addr();
+        let mut metadata = Metadata::new(
+            None,
+            identities,
+            false,
+            false,
+            peer.map(|peer| peer.ip()),
+            peer.map(|peer| peer.port()),
+        )
+        .await;
         metadata.add_client_info(client_info);
         Ok(metadata)
     }
 }
 
-/// The OSS transport cannot authenticate callers, so requests are not
-/// subject to access control.
-pub(crate) fn request_authorization_context(_ctx: &CoreContext) -> AuthorizationContext {
-    AuthorizationContext::new_oss_local()
+/// Callers with TLS certificates are subject to the repos' ACLs, as SLAPI's
+/// are; callers over plaintext loopback are not.
+pub(crate) fn request_authorization_context(ctx: &CoreContext) -> AuthorizationContext {
+    AuthorizationContext::new_oss(ctx)
 }
 
-/// Service writes need an authenticated service caller, which the OSS
-/// transport cannot provide, so requests naming a service are refused.
+/// A caller with a TLS certificate may act as a service if the service's
+/// ACL allows its identities, which each write checks. Callers over
+/// plaintext loopback can't be identified, so their requests naming a
+/// service are refused.
 pub(crate) fn service_authorization_context(
     ctx: &CoreContext,
     service_name: Option<String>,
 ) -> Result<AuthorizationContext, scs_errors::ServiceError> {
-    if service_name.is_some() {
-        return Err(scs_errors::invalid_request(
-            "service_identity is not accepted by OSS builds".to_string(),
-        )
-        .into());
+    let authz = request_authorization_context(ctx);
+    match service_name {
+        None => Ok(authz),
+        Some(_) if authz == AuthorizationContext::new_oss_local() => Err(
+            scs_errors::invalid_request(
+                "service_identity needs a TLS client certificate in OSS builds".to_string(),
+            )
+            .into(),
+        ),
+        Some(service_name) => Ok(AuthorizationContext::new_for_service_writes(service_name)),
     }
-    Ok(request_authorization_context(ctx))
 }
 
 pub(crate) fn set_nocache_header(_req_ctxt: &RequestContext) {}
@@ -118,9 +138,20 @@ mod tests {
 
     use super::*;
 
+    async fn ctx_for(fb: FacebookInit, req_ctxt: &RequestContext) -> CoreContext {
+        let metadata = RequestState
+            .create_metadata(req_ctxt)
+            .await
+            .expect("OSS request metadata should be created");
+        context::SessionContainer::builder(fb)
+            .metadata(std::sync::Arc::new(metadata))
+            .build()
+            .new_context(CoreContext::test_mock(fb).scuba().clone())
+    }
+
     #[mononoke::fbinit_test]
-    fn requests_are_not_subject_to_access_control(fb: FacebookInit) {
-        let ctx = CoreContext::test_mock(fb);
+    async fn loopback_requests_are_not_subject_to_access_control(fb: FacebookInit) {
+        let ctx = ctx_for(fb, &RequestContext::new()).await;
         assert_eq!(
             request_authorization_context(&ctx),
             AuthorizationContext::new_oss_local()
@@ -133,9 +164,46 @@ mod tests {
     }
 
     #[mononoke::fbinit_test]
-    fn requests_naming_a_service_are_refused(fb: FacebookInit) {
-        let ctx = CoreContext::test_mock(fb);
+    async fn loopback_requests_naming_a_service_are_refused(fb: FacebookInit) {
+        let ctx = ctx_for(fb, &RequestContext::new()).await;
         assert!(service_authorization_context(&ctx, Some("some_service".to_string())).is_err());
+    }
+
+    fn alice() -> RequestContext {
+        let identities = [
+            MononokeIdentity::from_legacy_type_data("USER", "alice"),
+            MononokeIdentity::from_legacy_type_data(
+                "X509_SUBJECT_NAME",
+                "CN=alice,O=mononoke-local",
+            ),
+        ];
+        RequestContext::for_peer(
+            "192.0.2.1:4000".parse().unwrap(),
+            Some(identities.into_iter().collect()),
+        )
+    }
+
+    #[mononoke::fbinit_test]
+    async fn tls_requests_carry_their_certificate_identities(fb: FacebookInit) {
+        let req_ctxt = alice();
+        let ctx = ctx_for(fb, &req_ctxt).await;
+        assert_eq!(
+            ctx.metadata().identities(),
+            req_ctxt.identities().expect("the context has identities")
+        );
+        assert_eq!(
+            ctx.metadata().client_ip(),
+            Some(&"192.0.2.1".parse().unwrap())
+        );
+        assert_eq!(
+            request_authorization_context(&ctx),
+            AuthorizationContext::new(&ctx)
+        );
+        assert_eq!(
+            service_authorization_context(&ctx, Some("some_service".to_string()))
+                .expect("a TLS caller may ask to act as a service"),
+            AuthorizationContext::new_for_service_writes("some_service")
+        );
     }
 
     #[mononoke::test]
