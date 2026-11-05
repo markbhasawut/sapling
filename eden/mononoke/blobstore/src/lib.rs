@@ -693,9 +693,102 @@ impl<L: Loadable + Sync + std::fmt::Debug, S: KeyedBlobstore> StoreLoadable<S> f
     ) -> Result<Self::Value, LoadableError> {
         self.load(ctx, store)
             .watched()
-            .with_label(format!("{__self:?}").as_str())
+            .with_label(&watchdog_label(__self))
             .with_max_poll(BLOBSTORE_MAX_POLL_TIME_MS)
             .await
+    }
+}
+
+/// Longest watchdog label: enough for any id, and its hash in full.
+const WATCHDOG_LABEL_LIMIT: usize = 256;
+
+/// The Debug form of `value`, cut after `WATCHDOG_LABEL_LIMIT` bytes, to name a
+/// load in slow-poll warnings. Some Loadables are whole manifests, such as a
+/// case-conflict skeleton manifest's subtrees, which its parent holds inline;
+/// formatting one in full on every load costs more than the load itself, so
+/// formatting stops at the limit.
+fn watchdog_label(value: &impl std::fmt::Debug) -> String {
+    struct Limited(String);
+
+    impl std::fmt::Write for Limited {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            let room = WATCHDOG_LABEL_LIMIT - self.0.len();
+            if s.len() <= room {
+                self.0.push_str(s);
+                return Ok(());
+            }
+            let mut end = room;
+            while !s.is_char_boundary(end) {
+                end -= 1;
+            }
+            self.0.push_str(&s[..end]);
+            // Stops the Debug impls, which return the first error they get.
+            Err(std::fmt::Error)
+        }
+    }
+
+    let mut label = Limited(String::new());
+    if std::fmt::write(&mut label, format_args!("{value:?}")).is_err() {
+        label.0.push_str("...");
+    }
+    label.0
+}
+
+#[cfg(test)]
+mod watchdog_label_test {
+    use std::cell::Cell;
+    use std::fmt;
+
+    use super::*;
+
+    /// A list of `entries` items, counting how many get formatted.
+    struct Big<'a> {
+        entries: usize,
+        formatted: &'a Cell<usize>,
+    }
+
+    struct Entry<'a>(usize, &'a Cell<usize>);
+
+    impl fmt::Debug for Entry<'_> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            self.1.set(self.1.get() + 1);
+            write!(f, "{}", self.0)
+        }
+    }
+
+    impl fmt::Debug for Big<'_> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_list()
+                .entries((0..self.entries).map(|i| Entry(i, self.formatted)))
+                .finish()
+        }
+    }
+
+    #[test]
+    fn test_short_labels_are_whole() {
+        let id = format!("ChangesetId(Blake2({}))", "ab".repeat(32));
+        assert_eq!(watchdog_label(&id), format!("{id:?}"));
+    }
+
+    #[test]
+    fn test_long_labels_stop_formatting() {
+        let formatted = Cell::new(0);
+        let label = watchdog_label(&Big {
+            entries: 100_000,
+            formatted: &formatted,
+        });
+        assert_eq!(label.len(), WATCHDOG_LABEL_LIMIT + "...".len());
+        assert!(label.starts_with("[0, 1, 2, "), "{label}");
+        assert!(label.ends_with("..."), "{label}");
+        // Formatting stopped at the limit, not after all 100,000 entries.
+        assert!(formatted.get() < 100, "{}", formatted.get());
+    }
+
+    #[test]
+    fn test_cut_at_a_character_boundary() {
+        let label = watchdog_label(&"é".repeat(200));
+        assert!(label.len() <= WATCHDOG_LABEL_LIMIT + "...".len());
+        assert!(label.ends_with("..."));
     }
 }
 
