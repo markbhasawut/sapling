@@ -576,3 +576,65 @@ async fn test_user_readonly_instance(fb: FacebookInit) -> () {
             .is_err()
     );
 }
+
+#[cfg(not(fbcode_build))]
+async fn ctx_with_identities(
+    fb: FacebookInit,
+    identities: &[permission_checker::MononokeIdentity],
+) -> CoreContext {
+    let metadata = metadata::Metadata::new(
+        None,
+        identities.iter().cloned().collect(),
+        false,
+        false,
+        None,
+        None,
+    )
+    .await;
+    let session = SessionContainer::builder(fb)
+        .metadata(Arc::new(metadata))
+        .build();
+    session.new_context(CoreContext::test_mock(fb).scuba().clone())
+}
+
+/// OSS servers allow everything to callers over plaintext loopback, and
+/// check the identities of callers with TLS certificates.
+#[cfg(not(fbcode_build))]
+#[mononoke::fbinit_test]
+async fn test_oss_contexts(fb: FacebookInit) {
+    use permission_checker::MononokeIdentity;
+
+    let local = ctx_with_identities(fb, &[MononokeIdentity::oss_local()]).await;
+    assert_eq!(
+        AuthorizationContext::new_oss(&local),
+        AuthorizationContext::new_oss_local()
+    );
+
+    let alice = [
+        MononokeIdentity::from_legacy_type_data("USER", "alice"),
+        MononokeIdentity::from_legacy_type_data(
+            "X509_SUBJECT_NAME",
+            "CN=alice,O=mononoke-local",
+        ),
+    ];
+    let tls = ctx_with_identities(fb, &alice).await;
+    assert_eq!(
+        AuthorizationContext::new_oss(&tls),
+        AuthorizationContext::new(&tls)
+    );
+    assert_ne!(
+        AuthorizationContext::new_oss(&tls),
+        AuthorizationContext::new_oss_local()
+    );
+
+    // OSS_LOCAL alongside other identities is not a loopback caller.
+    let mixed = ctx_with_identities(
+        fb,
+        &[MononokeIdentity::oss_local(), alice[0].clone()],
+    )
+    .await;
+    assert_eq!(
+        AuthorizationContext::new_oss(&mixed),
+        AuthorizationContext::new(&mixed)
+    );
+}
