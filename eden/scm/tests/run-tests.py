@@ -224,7 +224,12 @@ def checksocketfamily(name, port=20058):
     except socket.error as exc:
         if exc.errno == errno.EADDRINUSE:
             return True
-        elif exc.errno in (errno.EADDRNOTAVAIL, errno.EPROTONOSUPPORT):
+        elif exc.errno in (
+            errno.EADDRNOTAVAIL,
+            errno.EPROTONOSUPPORT,
+            # The kernel has no IPv6 at all, as in some containers.
+            errno.EAFNOSUPPORT,
+        ):
             return False
         else:
             raise
