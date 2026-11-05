@@ -43,6 +43,21 @@ pub(crate) struct ConnectionArgs {
     #[clap(long, short = 'H', global = true, env = "SCS_HOST")]
     /// Connect to SCS at a given host and port, format HOST:PORT (default: localhost:8367)
     host: Option<String>,
+    /// Connect over mutual TLS, trusting the server certificates this CA
+    /// signs. Needed for any host other than loopback.
+    #[clap(
+        long,
+        global = true,
+        env = "SCS_TLS_CA",
+        requires_all = ["tls_certificate", "tls_private_key"]
+    )]
+    tls_ca: Option<String>,
+    /// Client certificate to present over TLS
+    #[clap(long, global = true, env = "SCS_TLS_CERTIFICATE", requires = "tls_ca")]
+    tls_certificate: Option<String>,
+    /// Private key of the client certificate
+    #[clap(long, global = true, env = "SCS_TLS_PRIVATE_KEY", requires = "tls_ca")]
+    tls_private_key: Option<String>,
 }
 
 impl ConnectionArgs {
@@ -52,6 +67,11 @@ impl ConnectionArgs {
         _repo: Option<&str>,
     ) -> Result<ScsClient, Error> {
         let host = self.host.as_deref().unwrap_or(DEFAULT_SCS_HOST);
-        ScsClient::from_host_port(host).await
+        match (&self.tls_ca, &self.tls_certificate, &self.tls_private_key) {
+            (Some(ca), Some(certificate), Some(private_key)) => {
+                ScsClient::from_host_port_with_tls(host, ca, certificate, private_key).await
+            }
+            _ => ScsClient::from_host_port(host).await,
+        }
     }
 }

@@ -85,11 +85,24 @@ impl std::ops::Deref for ScsClient {
 
 #[cfg(not(fbcode_build))]
 impl ScsClient {
-    /// Connect to a loopback OSS SCS server.
+    /// Connect to an OSS SCS server over plaintext, which only loopback
+    /// addresses accept.
     ///
-    /// The OSS transport does not provide TLS, authentication, tier routing,
-    /// client correlators, or production service discovery.
+    /// The OSS transport does not provide tier routing, client correlators,
+    /// or production service discovery.
     pub async fn from_host_port(host_port: &str) -> anyhow::Result<Self> {
         oss::from_host_port(host_port)
+    }
+
+    /// Connect to an OSS SCS server over mutual TLS: present `certificate`
+    /// and `private_key`, and accept a server whose certificate `ca` signed
+    /// for the host dialled.
+    pub async fn from_host_port_with_tls(
+        host_port: &str,
+        ca: &str,
+        certificate: &str,
+        private_key: &str,
+    ) -> anyhow::Result<Self> {
+        oss::from_host_port_with_tls(host_port, ca, certificate, private_key)
     }
 }
