@@ -13,13 +13,20 @@ async-trait = "0.1.92"
 bytes = { version = "1.12.1", features = ["serde"] }
 fbthrift = { version = "0.0.1", git = "https://github.com/facebook/fbthrift.git", branch = "main" }
 futures = { version = "0.3.34", features = ["async-await", "compat"] }
+h2 = "0.4.20"
+http = "1.5.0"
 mononoke_macros = { version = "0.1.0", path = "../../mononoke_macros" }
+openssl = "0.10.80"
+permission_checker = { version = "0.1.0", path = "../../permission_checker" }
 tokio = { version = "1.54.1", features = ["full", "test-util", "tracing"] }
+tokio-openssl = "0.6.5"
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 
 [dev-dependencies]
 fb303_core = { version = "0.0.0", git = "https://github.com/facebook/fb303.git", branch = "main" }
+fb303_core_clients = { version = "0.0.0", git = "https://github.com/facebook/fb303.git", branch = "main" }
 fb303_core_services = { version = "0.0.0", git = "https://github.com/facebook/fb303.git", branch = "main" }
+quickcheck = "1.1"
 
 [lints]
 workspace = true
