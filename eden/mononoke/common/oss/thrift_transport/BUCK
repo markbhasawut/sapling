@@ -7,16 +7,23 @@ rust_library(
     srcs = glob(["src/**/*.rs"]),
     test_deps = [
         "//fb303/thrift:fb303_core-rust",
+        "//fb303/thrift:fb303_core-rust-clients",
         "//fb303/thrift:fb303_core-rust-services",
+        "fbsource//third-party/rust:quickcheck",
     ],
     deps = [
         "fbsource//third-party/rust:anyhow",
         "fbsource//third-party/rust:async-trait",
         "fbsource//third-party/rust:bytes",
         "fbsource//third-party/rust:futures",
+        "fbsource//third-party/rust:h2",
+        "fbsource//third-party/rust:http",
+        "fbsource//third-party/rust:openssl",
         "fbsource//third-party/rust:tokio",
+        "fbsource//third-party/rust:tokio-openssl",
         "fbsource//third-party/rust:tracing",
         "//eden/mononoke/common/mononoke_macros:mononoke_macros",
+        "//eden/mononoke/common/permission_checker:permission_checker",
         "//thrift/lib/rust:fbthrift",
     ],
 )

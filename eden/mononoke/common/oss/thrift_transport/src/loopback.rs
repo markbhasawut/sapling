@@ -12,12 +12,14 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
 
-/// Resolve `address`, failing unless it resolves to at least one address and
-/// every address it resolves to is a loopback address. `description` names
-/// the address in errors.
-pub(crate) fn resolve_loopback(
+/// Resolve `address`, failing unless it resolves to at least one address.
+/// Unless the connection will use TLS, every address it resolves to must
+/// also be a loopback address: plaintext is for tests and local development
+/// only. `description` names the address in errors.
+pub(crate) fn resolve(
     address: impl ToSocketAddrs,
     description: &str,
+    tls: bool,
 ) -> Result<Vec<SocketAddr>> {
     let resolved = address
         .to_socket_addrs()
@@ -26,15 +28,25 @@ pub(crate) fn resolve_loopback(
     if resolved.is_empty() {
         bail!("OSS thrift address {description} did not resolve to an address");
     }
-    if let Some(remote) = resolved
-        .iter()
-        .find(|resolved| !resolved.ip().is_loopback())
-    {
-        bail!(
-            "the OSS thrift transport is plaintext and unauthenticated; refusing non-loopback address {remote}"
-        );
+    if !tls {
+        if let Some(remote) = resolved
+            .iter()
+            .find(|resolved| !resolved.ip().is_loopback())
+        {
+            bail!(
+                "plaintext OSS thrift connections are unauthenticated; refusing non-loopback address {remote} without TLS"
+            );
+        }
     }
     Ok(resolved)
+}
+
+/// [`resolve`] for a plaintext connection.
+pub(crate) fn resolve_loopback(
+    address: impl ToSocketAddrs,
+    description: &str,
+) -> Result<Vec<SocketAddr>> {
+    resolve(address, description, false)
 }
 
 #[cfg(test)]
@@ -56,5 +68,11 @@ mod tests {
         assert!(resolve_loopback("0.0.0.0:0", "0.0.0.0:0").is_err());
         assert!(resolve_loopback("[::]:0", "[::]:0").is_err());
         assert!(resolve_loopback("192.0.2.1:1234", "192.0.2.1:1234").is_err());
+    }
+
+    #[mononoke::test]
+    fn tls_allows_any_address() {
+        resolve("0.0.0.0:0", "0.0.0.0:0", true).expect("TLS may listen anywhere");
+        resolve("192.0.2.1:1234", "192.0.2.1:1234", true).expect("TLS may connect anywhere");
     }
 }

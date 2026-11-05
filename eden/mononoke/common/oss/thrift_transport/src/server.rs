@@ -7,14 +7,20 @@
 
 //! Server end of the transport.
 //!
-//! A connection is served serially: read a request frame, await the
-//! handler, write the reply, then read the next request. A streaming reply
-//! holds its connection until the stream ends.
+//! Each connection is an HTTP/2 connection, over TLS unless it is on
+//! loopback, and each request is one of its streams, served by its own task.
+//! A streaming reply's elements are pulled from the service only as the
+//! client's flow-control window lets them be sent.
 
 use std::ffi::CStr;
+use std::future::poll_fn;
 use std::io::Cursor;
+use std::net::SocketAddr;
 use std::net::TcpListener as StdTcpListener;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::task::Context as TaskContext;
+use std::task::Poll;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -23,6 +29,7 @@ use anyhow::anyhow;
 use anyhow::bail;
 use async_trait::async_trait;
 use bytes::Bytes;
+use bytes::BytesMut;
 use fbthrift::ApplicationException;
 use fbthrift::ApplicationExceptionErrorCode;
 use fbthrift::BinaryProtocol;
@@ -38,37 +45,116 @@ use fbthrift::processor::MethodMetadata;
 use fbthrift::processor::ReplyState as ThriftReplyState;
 use fbthrift::processor::SerializedStreamElement;
 use fbthrift::processor::ThriftService;
-use fbthrift::request_context::DummyRequestContext;
 use fbthrift::thrift_protocol::ProtocolID;
 use futures::stream::BoxStream;
 use futures::stream::StreamExt;
+use h2::Reason;
+use h2::RecvStream;
+use h2::SendStream;
+use h2::server::SendResponse;
+use http::Method;
+use http::Response;
+use http::StatusCode;
+use permission_checker::MononokeIdentity;
+use permission_checker::MononokeIdentitySetExt;
+use tokio::io::AsyncRead;
+use tokio::io::AsyncWrite;
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
+use tokio::sync::Semaphore;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
+use tokio::time::Instant;
 use tokio::time::sleep;
+use tokio::time::sleep_until;
 use tokio::time::timeout;
+use tokio::time::timeout_at;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
 
+pub use crate::context::RequestContext;
+use crate::context::ConnectionInfo;
 use crate::framing::MAX_FRAME_SIZE;
 use crate::framing::StreamFrame;
-use crate::framing::read_frame;
-use crate::framing::write_frame;
+use crate::framing::encode_frame;
+use crate::loopback::resolve;
 use crate::loopback::resolve_loopback;
+use crate::tls::ServerTls;
 
-const MAX_CONNECTIONS: usize = 256;
-const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-/// A frame that cannot be written within this time ends its connection,
-/// including a stream whose client has stopped reading.
-const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+/// How long to keep flushing a connection once it has been aborted.
+const ABORT_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Request context passed to services. It carries no caller identity.
-pub type RequestContext = DummyRequestContext<CStr, Bytes>;
+/// What a server allows its clients. See `DESIGN.md` for why each exists.
+#[derive(Clone, Debug)]
+pub struct Limits {
+    /// Largest request message.
+    pub max_request_size: usize,
+    /// Largest unary reply, initial response, or stream element.
+    pub max_response_size: usize,
+    /// Connections served at once; further clients wait to be accepted.
+    pub max_connections: usize,
+    /// Requests in flight on one connection, advertised to the client.
+    pub max_concurrent_streams: u32,
+    /// Requests in flight on the whole server; more are refused, unprocessed.
+    pub max_in_flight_requests: usize,
+    /// HTTP/2 frame size and header list size the server accepts.
+    pub max_frame_size: u32,
+    pub max_header_list_size: u32,
+    /// Flow-control windows the server gives the client to send in.
+    pub stream_window: u32,
+    pub connection_window: u32,
+    /// Time to finish the TLS and HTTP/2 handshakes.
+    pub handshake_timeout: Duration,
+    /// Time from a request's start to its last byte.
+    pub request_read_timeout: Duration,
+    /// Time a connection may stay open with no requests.
+    pub idle_timeout: Duration,
+    /// Time for a handler to produce its reply, or a stream's first
+    /// response.
+    pub handler_timeout: Duration,
+    /// Time a streaming or large reply may wait for the client to read.
+    pub stream_stall_timeout: Duration,
+    /// Time in-flight requests get to finish once shutdown begins.
+    pub drain_timeout: Duration,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_request_size: MAX_FRAME_SIZE,
+            max_response_size: MAX_FRAME_SIZE,
+            max_connections: 1024,
+            max_concurrent_streams: 128,
+            max_in_flight_requests: 4096,
+            max_frame_size: 16 * 1024,
+            max_header_list_size: 16 * 1024,
+            stream_window: 1024 * 1024,
+            connection_window: 16 * 1024 * 1024,
+            handshake_timeout: Duration::from_secs(10),
+            request_read_timeout: Duration::from_secs(30),
+            idle_timeout: Duration::from_secs(5 * 60),
+            handler_timeout: Duration::from_secs(15 * 60),
+            stream_stall_timeout: Duration::from_secs(60),
+            drain_timeout: Duration::from_secs(25),
+        }
+    }
+}
+
+/// How a server is secured and limited.
+#[derive(Clone, Default)]
+pub struct ServerConfig {
+    /// Mutual TLS. Without it, the server only listens on loopback.
+    pub tls: Option<ServerTls>,
+    pub limits: Limits,
+    /// Stop a unary handler when its client resets the request. Otherwise
+    /// it runs to completion. Streams always stop when their client resets
+    /// them.
+    pub cancel_on_client_disconnect: bool,
+}
 
 /// A service as served by this transport.
 pub type BoxService = Box<
@@ -77,8 +163,8 @@ pub type BoxService = Box<
         + 'static,
 >;
 
-/// Creates the service for a connection, given the protocol the connection's
-/// first request was written in.
+/// Creates a service for a connection, given the protocol of a request it
+/// received.
 pub type ServiceFactory =
     dyn Fn(ProtocolID) -> Result<BoxService, ApplicationException> + Send + Sync;
 
@@ -94,44 +180,95 @@ where
     Box::new(HandlerErased(service))
 }
 
-/// Bind a listener to `host` and `port`. `host` is resolved once, here, and
-/// must resolve only to loopback addresses.
+/// Bind a plaintext listener to `host` and `port`. `host` is resolved once,
+/// here, and must resolve only to loopback addresses.
 pub fn bind(host: &str, port: u16) -> Result<StdTcpListener> {
     let resolved = resolve_loopback((host, port), &format!("{host}:{port}"))?;
-    let listener = StdTcpListener::bind(&resolved[..])
-        .with_context(|| format!("failed to bind to {host}:{port}"))?;
+    bind_resolved(host, port, &resolved)
+}
+
+/// Bind a listener for a server with `config`. Without TLS, `host` must
+/// resolve only to loopback addresses.
+pub fn bind_with(host: &str, port: u16, config: &ServerConfig) -> Result<StdTcpListener> {
+    let resolved = resolve(
+        (host, port),
+        &format!("{host}:{port}"),
+        config.tls.is_some(),
+    )?;
+    bind_resolved(host, port, &resolved)
+}
+
+fn bind_resolved(host: &str, port: u16, resolved: &[SocketAddr]) -> Result<StdTcpListener> {
+    let listener =
+        StdTcpListener::bind(resolved).with_context(|| format!("failed to bind to {host}:{port}"))?;
     listener
         .set_nonblocking(true)
         .context("failed to make the listener non-blocking")?;
     Ok(listener)
 }
 
-/// Serve connections on `listener` until `shutdown` fires or its sender is
-/// dropped. Then stop accepting, let each open connection finish the request
-/// it is serving, and return.
+/// Serve plaintext connections on `listener`, which must be on loopback,
+/// with the default limits. See [`serve_with`].
 pub async fn serve(
     listener: TcpListener,
     service_factory: Arc<ServiceFactory>,
-    mut shutdown: oneshot::Receiver<()>,
+    shutdown: oneshot::Receiver<()>,
 ) {
-    let (connection_shutdown_tx, connection_shutdown_rx) = watch::channel(false);
+    serve_with(listener, service_factory, shutdown, ServerConfig::default()).await
+}
+
+/// Serve connections on `listener` until `shutdown` fires or its sender is
+/// dropped. Then stop accepting, tell each client which of its requests will
+/// still be answered, let those finish for up to the drain timeout, and
+/// return.
+///
+/// Without TLS in `config`, a listener that isn't on loopback is refused.
+pub async fn serve_with(
+    listener: TcpListener,
+    service_factory: Arc<ServiceFactory>,
+    mut shutdown: oneshot::Receiver<()>,
+    config: ServerConfig,
+) {
+    if config.tls.is_none() {
+        match listener.local_addr() {
+            Ok(address) if address.ip().is_loopback() => {}
+            Ok(address) => {
+                error!(
+                    "refusing to serve plaintext thrift on non-loopback address {address}; configure TLS"
+                );
+                return;
+            }
+            Err(error) => {
+                error!("cannot check the thrift listener's address: {error:#}");
+                return;
+            }
+        }
+    }
+
+    let limits = config.limits.clone();
+    let shared = Arc::new(Shared {
+        in_flight: Arc::new(Semaphore::new(limits.max_in_flight_requests)),
+        factory: service_factory,
+        config,
+    });
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut connections = JoinSet::new();
 
     loop {
         tokio::select! {
-            accepted = listener.accept(), if connections.len() < MAX_CONNECTIONS => {
+            accepted = listener.accept(), if connections.len() < limits.max_connections => {
                 match accepted {
                     Ok((stream, peer)) => {
                         debug!("accepted thrift connection from {peer}");
-                        // Frames are flushed individually; Nagle would stall
-                        // each one on the peer's delayed ACK.
+                        // HTTP/2 frames are small and flushed promptly;
+                        // Nagle would stall them on the peer's delayed ACK.
                         if let Err(error) = stream.set_nodelay(true) {
                             warn!("failed to set TCP_NODELAY on connection from {peer}: {error:#}");
                         }
-                        let factory = service_factory.clone();
-                        let shutdown = connection_shutdown_rx.clone();
+                        let shared = shared.clone();
+                        let shutdown = shutdown_rx.clone();
                         connections.spawn(async move {
-                            if let Err(error) = handle_connection(stream, &*factory, shutdown).await {
+                            if let Err(error) = handle_connection(stream, peer, shared, shutdown).await {
                                 debug!("thrift connection from {peer} ended: {error:#}");
                             }
                         });
@@ -157,15 +294,537 @@ pub async fn serve(
     }
 
     drop(listener);
-    let _ = connection_shutdown_tx.send(true);
-    while let Some(joined) = connections.join_next().await {
-        if let Err(error) = joined {
-            error!("thrift connection task failed during shutdown: {error:#}");
+    let _ = shutdown_tx.send(true);
+    // Each connection drains within the drain timeout, after its handshake
+    // if it is still in one; this only guards against one that doesn't.
+    let deadline = Instant::now() + limits.drain_timeout + limits.handshake_timeout;
+    loop {
+        match timeout_at(deadline, connections.join_next()).await {
+            Ok(Some(Ok(()))) => {}
+            Ok(Some(Err(error))) => {
+                error!("thrift connection task failed during shutdown: {error:#}");
+            }
+            Ok(None) => break,
+            Err(_) => {
+                error!("thrift connections did not drain; aborting them");
+                connections.shutdown().await;
+                break;
+            }
         }
     }
 }
 
-/// Reply sent from the service to its connection.
+/// What every connection of a server shares.
+struct Shared {
+    factory: Arc<ServiceFactory>,
+    config: ServerConfig,
+    in_flight: Arc<Semaphore>,
+}
+
+async fn handle_connection(
+    tcp: TcpStream,
+    peer: SocketAddr,
+    shared: Arc<Shared>,
+    shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    let handshake_deadline = Instant::now() + shared.config.limits.handshake_timeout;
+    match shared.config.tls.clone() {
+        Some(tls) => {
+            let (stream, certificate) = timeout_at(handshake_deadline, tls.accept(tcp))
+                .await
+                .context("timed out in the TLS handshake")??;
+            let identities = MononokeIdentity::try_from_x509(&certificate)
+                .context("cannot take identities from the client's certificate")?;
+            if identities.is_empty() {
+                bail!("the client's certificate has no identities");
+            }
+            debug!(
+                "thrift connection from {peer} identified as {}",
+                identities.to_string()
+            );
+            let info = Arc::new(ConnectionInfo {
+                peer_addr: peer,
+                identities: Some(identities),
+            });
+            serve_connection(stream, info, shared, shutdown, handshake_deadline).await
+        }
+        None => {
+            let info = Arc::new(ConnectionInfo {
+                peer_addr: peer,
+                identities: None,
+            });
+            serve_connection(tcp, info, shared, shutdown, handshake_deadline).await
+        }
+    }
+}
+
+fn http2_builder(limits: &Limits) -> h2::server::Builder {
+    let mut builder = h2::server::Builder::new();
+    builder
+        .max_concurrent_streams(limits.max_concurrent_streams)
+        .max_frame_size(limits.max_frame_size)
+        .max_header_list_size(limits.max_header_list_size)
+        .initial_window_size(limits.stream_window)
+        .initial_connection_window_size(limits.connection_window)
+        // Mitigations for floods of reset streams (CVE-2023-44487 and
+        // CVE-2024-27316's kin).
+        .max_pending_accept_reset_streams(20)
+        .max_local_error_reset_streams(Some(256));
+    builder
+}
+
+async fn serve_connection<T>(
+    io: T,
+    info: Arc<ConnectionInfo>,
+    shared: Arc<Shared>,
+    mut shutdown: watch::Receiver<bool>,
+    handshake_deadline: Instant,
+) -> Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let limits = shared.config.limits.clone();
+    let mut connection = timeout_at(
+        handshake_deadline,
+        http2_builder(&limits).handshake::<_, Bytes>(io),
+    )
+    .await
+    .context("timed out in the HTTP/2 handshake")?
+    .context("HTTP/2 handshake failed")?;
+
+    let services = Arc::new(Services::new(shared.factory.clone()));
+    let mut requests = JoinSet::new();
+    let mut drain_deadline: Option<Instant> = None;
+    let idle = sleep(limits.idle_timeout);
+    tokio::pin!(idle);
+
+    let result = loop {
+        tokio::select! {
+            accepted = connection.accept() => match accepted {
+                Some(Ok((request, respond))) => {
+                    requests.spawn(handle_request(
+                        request,
+                        respond,
+                        services.clone(),
+                        info.clone(),
+                        shared.clone(),
+                    ));
+                }
+                Some(Err(error)) => break Err(anyhow!(error).context("HTTP/2 connection failed")),
+                None => break Ok(()),
+            },
+            Some(joined) = requests.join_next(), if !requests.is_empty() => {
+                if let Err(error) = joined {
+                    if error.is_panic() {
+                        error!("thrift request task panicked: {error:#}");
+                    }
+                }
+                if requests.is_empty() {
+                    idle.as_mut().reset(Instant::now() + limits.idle_timeout);
+                }
+            }
+            _ = &mut idle, if requests.is_empty() && drain_deadline.is_none() => {
+                debug!("closing idle thrift connection from {}", info.peer_addr);
+                connection.graceful_shutdown();
+                drain_deadline = Some(Instant::now() + limits.drain_timeout);
+            }
+            _ = shutdown.changed(), if drain_deadline.is_none() => {
+                // GOAWAY tells the client which requests will be answered,
+                // so it can send the rest to another server.
+                connection.graceful_shutdown();
+                drain_deadline = Some(Instant::now() + limits.drain_timeout);
+            }
+            _ = sleep_until(drain_deadline.unwrap_or_else(Instant::now)), if drain_deadline.is_some() => {
+                if !requests.is_empty() {
+                    warn!(
+                        "aborting {} thrift requests from {} still running after the drain timeout",
+                        requests.len(),
+                        info.peer_addr,
+                    );
+                }
+                requests.abort_all();
+                connection.abrupt_shutdown(Reason::NO_ERROR);
+                let _ = timeout(ABORT_FLUSH_TIMEOUT, poll_fn(|cx| connection.poll_closed(cx))).await;
+                break Ok(());
+            }
+        }
+    };
+
+    requests.shutdown().await;
+    services.terminate().await;
+    result
+}
+
+/// The services a connection has created, one per protocol its requests use.
+struct Services {
+    factory: Arc<ServiceFactory>,
+    created: Mutex<Vec<(ProtocolID, Arc<BoxService>)>>,
+}
+
+impl Services {
+    fn new(factory: Arc<ServiceFactory>) -> Self {
+        Self {
+            factory,
+            created: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn get(&self, proto: ProtocolID) -> Result<Arc<BoxService>, ApplicationException> {
+        let mut created = self.created.lock().expect("services lock poisoned");
+        if let Some((_, service)) = created.iter().find(|(created, _)| *created == proto) {
+            return Ok(service.clone());
+        }
+        let service = Arc::new((self.factory)(proto)?);
+        created.push((proto, service.clone()));
+        Ok(service)
+    }
+
+    async fn terminate(&self) {
+        let created = std::mem::take(&mut *self.created.lock().expect("services lock poisoned"));
+        for (_, service) in created {
+            service.on_termination().await;
+        }
+    }
+}
+
+enum ReadError {
+    TooLarge,
+    Stream(h2::Error),
+}
+
+async fn read_body(mut body: RecvStream, max: usize) -> Result<Bytes, ReadError> {
+    let mut buffer = BytesMut::new();
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk.map_err(ReadError::Stream)?;
+        let _ = body.flow_control().release_capacity(chunk.len());
+        if buffer.len() + chunk.len() > max {
+            return Err(ReadError::TooLarge);
+        }
+        buffer.extend_from_slice(&chunk);
+    }
+    Ok(buffer.freeze())
+}
+
+fn send_status(respond: &mut SendResponse<Bytes>, status: StatusCode) {
+    let response = Response::builder()
+        .status(status)
+        .body(())
+        .expect("a status-only response is valid");
+    if let Err(error) = respond.send_response(response, true) {
+        debug!("failed to send HTTP status {status}: {error:#}");
+    }
+}
+
+fn start_reply(respond: &mut SendResponse<Bytes>) -> Result<SendStream<Bytes>> {
+    let response = Response::builder()
+        .status(StatusCode::OK)
+        .header(http::header::CONTENT_TYPE, crate::CONTENT_TYPE)
+        .body(())
+        .expect("a reply's response head is valid");
+    respond
+        .send_response(response, false)
+        .context("failed to start the reply")
+}
+
+async fn handle_request(
+    request: http::Request<RecvStream>,
+    mut respond: SendResponse<Bytes>,
+    services: Arc<Services>,
+    info: Arc<ConnectionInfo>,
+    shared: Arc<Shared>,
+) {
+    let limits = &shared.config.limits;
+    // Refused before anything runs, so the client may send it elsewhere.
+    let Ok(_in_flight) = shared.in_flight.clone().try_acquire_owned() else {
+        debug!("refusing a thrift request: too many requests in flight");
+        respond.send_reset(Reason::REFUSED_STREAM);
+        return;
+    };
+    if request.method() != Method::POST {
+        send_status(&mut respond, StatusCode::METHOD_NOT_ALLOWED);
+        return;
+    }
+    let path = request.uri().path().to_owned();
+    let body = match timeout(
+        limits.request_read_timeout,
+        read_body(request.into_body(), limits.max_request_size),
+    )
+    .await
+    {
+        Ok(Ok(body)) => body,
+        Ok(Err(ReadError::TooLarge)) => {
+            send_status(&mut respond, StatusCode::PAYLOAD_TOO_LARGE);
+            return;
+        }
+        Ok(Err(ReadError::Stream(error))) => {
+            debug!("failed to read thrift request {path}: {error:#}");
+            return;
+        }
+        Err(_) => {
+            debug!("timed out reading thrift request {path}");
+            respond.send_reset(Reason::CANCEL);
+            return;
+        }
+    };
+    let Ok(proto) = detect_protocol(&body) else {
+        send_status(&mut respond, StatusCode::BAD_REQUEST);
+        return;
+    };
+
+    if let Err(error) = run_request(&mut respond, body, proto, services, info, &shared).await {
+        debug!("thrift request {path} failed: {error:#}");
+        respond.send_reset(Reason::INTERNAL_ERROR);
+    }
+}
+
+/// Run one request through its service and send the reply. An error means
+/// the reply could not be sent, and the stream should be reset.
+async fn run_request(
+    respond: &mut SendResponse<Bytes>,
+    request: Bytes,
+    proto: ProtocolID,
+    services: Arc<Services>,
+    info: Arc<ConnectionInfo>,
+    shared: &Shared,
+) -> Result<()> {
+    let limits = &shared.config.limits;
+    let service = match services.get(proto) {
+        Ok(service) => service,
+        Err(error) => {
+            let reply = exception_reply(
+                &request,
+                proto,
+                ApplicationExceptionErrorCode::InternalError,
+                format!("failed to create service for protocol {proto:?}: {error}"),
+            )?;
+            return send_unary(respond, &reply, limits).await;
+        }
+    };
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let reply_state = Arc::new(ReplyState::new(reply_tx));
+    let request_context = RequestContext::for_connection(info);
+    let call_request = request.clone();
+    let call = async move {
+        service
+            .call(Cursor::new(call_request), &request_context, reply_state)
+            .await
+            .context("thrift service call failed")?;
+        reply_rx.await.map_err(|_| anyhow!("service did not reply"))
+    };
+    tokio::pin!(call);
+
+    let deadline = Instant::now() + limits.handler_timeout;
+    let reply = tokio::select! {
+        reply = timeout_at(deadline, &mut call) => reply,
+        reset = poll_fn(|cx| respond.poll_reset(cx)) => {
+            debug!("client reset the request: {reset:?}");
+            if !shared.config.cancel_on_client_disconnect {
+                // Run to completion as asked; nobody waits for the reply.
+                let _ = timeout_at(deadline, &mut call).await;
+            }
+            return Ok(());
+        }
+    };
+
+    let reply = match reply {
+        Ok(Ok(reply)) => reply,
+        Ok(Err(error)) => {
+            let reply = exception_reply(
+                &request,
+                proto,
+                ApplicationExceptionErrorCode::InternalError,
+                format!("{error:#}"),
+            )?;
+            return send_unary(respond, &reply, limits).await;
+        }
+        Err(_) => {
+            let reply = exception_reply(
+                &request,
+                proto,
+                ApplicationExceptionErrorCode::Timeout,
+                format!(
+                    "the handler did not reply within {:?}",
+                    limits.handler_timeout
+                ),
+            )?;
+            return send_unary(respond, &reply, limits).await;
+        }
+    };
+
+    match reply {
+        Reply::Unary(response) => {
+            let response = if response.len() > limits.max_response_size {
+                error!(
+                    "unary response is {} bytes, over the {} byte limit; replying with an application exception",
+                    response.len(),
+                    limits.max_response_size,
+                );
+                exception_reply(
+                    &request,
+                    proto,
+                    ApplicationExceptionErrorCode::InternalError,
+                    format!(
+                        "response exceeds the OSS transport limit of {} bytes",
+                        limits.max_response_size
+                    ),
+                )?
+            } else {
+                response
+            };
+            send_unary(respond, &response, limits).await
+        }
+        Reply::Stream {
+            first,
+            stream: elements,
+            protocol_id,
+        } => {
+            if first.len() > limits.max_response_size {
+                let reply = exception_reply(
+                    &request,
+                    proto,
+                    ApplicationExceptionErrorCode::InternalError,
+                    format!(
+                        "initial stream response exceeds the OSS transport limit of {} bytes",
+                        limits.max_response_size
+                    ),
+                )?;
+                return send_unary(respond, &reply, limits).await;
+            }
+            let mut stream = start_reply(respond)?;
+            let frame = encode_frame(&first, limits.max_response_size)?;
+            send_bytes(&mut stream, frame, false, limits.stream_stall_timeout).await?;
+            write_stream(&mut stream, elements, protocol_id, limits).await
+        }
+    }
+}
+
+async fn send_unary(
+    respond: &mut SendResponse<Bytes>,
+    reply: &[u8],
+    limits: &Limits,
+) -> Result<()> {
+    // An exception reply can be a little over the limit that its message
+    // reports; frame it anyway.
+    let frame = encode_frame(reply, limits.max_response_size.max(reply.len()))?;
+    let mut stream = start_reply(respond)?;
+    send_bytes(&mut stream, frame, true, limits.stream_stall_timeout).await
+}
+
+/// Wait until the client's flow-control window has room, failing if the
+/// client resets the stream.
+fn poll_capacity(stream: &mut SendStream<Bytes>, cx: &mut TaskContext<'_>) -> Poll<Result<usize>> {
+    if let Poll::Ready(reset) = stream.poll_reset(cx) {
+        return Poll::Ready(Err(anyhow!("client reset the stream: {reset:?}")));
+    }
+    if stream.capacity() > 0 {
+        return Poll::Ready(Ok(stream.capacity()));
+    }
+    match stream.poll_capacity(cx) {
+        Poll::Ready(Some(Ok(capacity))) => Poll::Ready(Ok(capacity)),
+        Poll::Ready(Some(Err(error))) => Poll::Ready(Err(anyhow!(error))),
+        Poll::Ready(None) => Poll::Ready(Err(anyhow!("the stream closed"))),
+        Poll::Pending => Poll::Pending,
+    }
+}
+
+/// Send `data` as the window allows, so a client that reads slowly holds
+/// back the sender rather than filling its memory.
+async fn send_bytes(
+    stream: &mut SendStream<Bytes>,
+    mut data: Bytes,
+    end_of_stream: bool,
+    stall_timeout: Duration,
+) -> Result<()> {
+    while !data.is_empty() {
+        stream.reserve_capacity(data.len());
+        let capacity = timeout(stall_timeout, poll_fn(|cx| poll_capacity(stream, cx)))
+            .await
+            .context("the client stopped reading")??;
+        let chunk = data.split_to(capacity.min(data.len()));
+        stream
+            .send_data(chunk, end_of_stream && data.is_empty())
+            .context("failed to send reply data")?;
+    }
+    Ok(())
+}
+
+/// Write the elements of a streaming reply, pulling each from the service
+/// only once the previous one is sent, and stopping if the client resets
+/// the stream, which drops `elements` and so cancels its producer.
+async fn write_stream(
+    stream: &mut SendStream<Bytes>,
+    elements: Option<BoxStream<'static, SerializedStreamElement<FramingEncodedFinal<Bytes>>>>,
+    protocol_id: ProtocolID,
+    limits: &Limits,
+) -> Result<()> {
+    if let Some(mut elements) = elements {
+        loop {
+            let next = poll_fn(|cx| {
+                if let Poll::Ready(reset) = stream.poll_reset(cx) {
+                    return Poll::Ready(Err(anyhow!("client reset the stream: {reset:?}")));
+                }
+                elements.poll_next_unpin(cx).map(Ok)
+            })
+            .await?;
+            let Some(element) = next else {
+                break;
+            };
+            let (frame, terminal) = match element {
+                SerializedStreamElement::Success(payload) => (StreamFrame::Success(payload), false),
+                SerializedStreamElement::DeclaredException { payload, .. } => {
+                    (StreamFrame::DeclaredException(payload), true)
+                }
+                SerializedStreamElement::ApplicationException(ex) => (
+                    StreamFrame::ApplicationException(serialize_application_exception(
+                        &ex,
+                        protocol_id,
+                    )),
+                    true,
+                ),
+            };
+            let frame = if frame.encode(limits.max_response_size).is_ok() {
+                frame
+            } else {
+                error!("stream element exceeds the frame limit; ending the stream with an exception");
+                let ex = ApplicationException::new(
+                    ApplicationExceptionErrorCode::InternalError,
+                    "stream element exceeds the OSS transport frame limit".to_string(),
+                );
+                return send_stream_frame(
+                    stream,
+                    StreamFrame::ApplicationException(serialize_application_exception(
+                        &ex,
+                        protocol_id,
+                    )),
+                    true,
+                    limits,
+                )
+                .await;
+            };
+            send_stream_frame(stream, frame, terminal, limits).await?;
+            if terminal {
+                return Ok(());
+            }
+        }
+    }
+    send_stream_frame(stream, StreamFrame::EndOfStream, true, limits).await
+}
+
+async fn send_stream_frame(
+    stream: &mut SendStream<Bytes>,
+    frame: StreamFrame,
+    end_of_stream: bool,
+    limits: &Limits,
+) -> Result<()> {
+    let frame = encode_frame(
+        &frame.encode(limits.max_response_size)?,
+        limits.max_response_size,
+    )?;
+    send_bytes(stream, frame, end_of_stream, limits.stream_stall_timeout).await
+}
+
+/// Reply sent from the service to the request's task.
 enum Reply {
     Unary(Bytes),
     Stream {
@@ -175,7 +834,7 @@ enum Reply {
     },
 }
 
-/// Hands the service's reply to the connection that received the request.
+/// Hands the service's reply to the task serving the request.
 pub struct ReplyState {
     reply_tx: std::sync::Mutex<Option<oneshot::Sender<Reply>>>,
 }
@@ -374,576 +1033,12 @@ fn exception_reply(
     })
 }
 
-async fn write_reply_frame(stream: &mut TcpStream, frame: &[u8]) -> Result<()> {
-    timeout(WRITE_TIMEOUT, write_frame(stream, frame))
-        .await
-        .context("timed out writing thrift reply")?
-}
-
-/// Reply to `request` with an internal-error exception, then fail the
-/// connection with `error`.
-async fn fail_request(
-    stream: &mut TcpStream,
-    request: &Bytes,
-    proto: ProtocolID,
-    error: anyhow::Error,
-) -> Result<()> {
-    let reply = exception_reply(
-        request,
-        proto,
-        ApplicationExceptionErrorCode::InternalError,
-        format!("{error:#}"),
-    )?;
-    write_reply_frame(stream, &reply).await?;
-    Err(error)
-}
-
-async fn handle_connection(
-    mut stream: TcpStream,
-    service_factory: &ServiceFactory,
-    mut shutdown: watch::Receiver<bool>,
-) -> Result<()> {
-    let mut service = None;
-    let result = handle_requests(&mut stream, service_factory, &mut shutdown, &mut service).await;
-    if let Some((_, service)) = service {
-        service.on_termination().await;
-    }
-    result
-}
-
-async fn handle_requests(
-    stream: &mut TcpStream,
-    service_factory: &ServiceFactory,
-    shutdown: &mut watch::Receiver<bool>,
-    service: &mut Option<(ProtocolID, BoxService)>,
-) -> Result<()> {
-    loop {
-        let request = tokio::select! {
-            _ = shutdown.changed() => return Ok(()),
-            frame = timeout(CONNECTION_IDLE_TIMEOUT, read_frame(stream)) => {
-                frame.context("timed out waiting for thrift request")??
-            }
-        };
-        let Some(request) = request else {
-            return Ok(());
-        };
-        let proto = detect_protocol(&request)?;
-        if service.is_none() {
-            let created = service_factory(proto).map_err(|error| {
-                anyhow!("failed to create service for protocol {proto:?}: {error}")
-            })?;
-            *service = Some((proto, created));
-        }
-        let (connection_proto, service) = service
-            .as_ref()
-            .context("service should exist after initialization")?;
-        if *connection_proto != proto {
-            bail!("connection changed thrift protocol from {connection_proto:?} to {proto:?}");
-        }
-
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let reply_state = Arc::new(ReplyState::new(reply_tx));
-        let request_context = RequestContext::new();
-        if let Err(error) = service
-            .call(Cursor::new(request.clone()), &request_context, reply_state)
-            .await
-        {
-            return fail_request(
-                stream,
-                &request,
-                proto,
-                error.context("thrift service call failed"),
-            )
-            .await;
-        }
-        let reply = match reply_rx.await {
-            Ok(reply) => reply,
-            Err(_) => {
-                return fail_request(stream, &request, proto, anyhow!("service did not reply"))
-                    .await;
-            }
-        };
-
-        match reply {
-            Reply::Unary(response) => {
-                let response = if response.len() > MAX_FRAME_SIZE {
-                    error!(
-                        "unary response is {} bytes, over the {MAX_FRAME_SIZE} byte frame limit; replying with an application exception",
-                        response.len(),
-                    );
-                    exception_reply(
-                        &request,
-                        proto,
-                        ApplicationExceptionErrorCode::InternalError,
-                        format!(
-                            "response exceeds the OSS transport frame limit of {MAX_FRAME_SIZE} bytes"
-                        ),
-                    )?
-                } else {
-                    response
-                };
-                write_reply_frame(stream, &response).await?;
-            }
-            Reply::Stream {
-                first,
-                stream: elements,
-                protocol_id,
-            } => {
-                if first.len() > MAX_FRAME_SIZE {
-                    return fail_request(
-                        stream,
-                        &request,
-                        proto,
-                        anyhow!(
-                            "initial stream response exceeds the OSS transport frame limit of {MAX_FRAME_SIZE} bytes"
-                        ),
-                    )
-                    .await;
-                }
-                write_reply_frame(stream, &first).await?;
-                if !write_stream(stream, elements, protocol_id).await? {
-                    return Ok(());
-                }
-            }
-        }
-    }
-}
-
-/// Write the elements of a streaming reply. Returns whether the stream ended
-/// successfully, in which case the connection may serve another request.
-async fn write_stream(
-    stream: &mut TcpStream,
-    elements: Option<BoxStream<'static, SerializedStreamElement<FramingEncodedFinal<Bytes>>>>,
-    protocol_id: ProtocolID,
-) -> Result<bool> {
-    if let Some(mut elements) = elements {
-        while let Some(element) = elements.next().await {
-            let (frame, terminal) = match element {
-                SerializedStreamElement::Success(payload) => (StreamFrame::Success(payload), false),
-                SerializedStreamElement::DeclaredException { payload, .. } => {
-                    (StreamFrame::DeclaredException(payload), true)
-                }
-                SerializedStreamElement::ApplicationException(ex) => (
-                    StreamFrame::ApplicationException(serialize_application_exception(
-                        &ex,
-                        protocol_id,
-                    )),
-                    true,
-                ),
-            };
-            let (frame, terminal) = match frame.encode() {
-                Ok(frame) => (frame, terminal),
-                Err(error) => {
-                    error!("cannot encode stream element: {error:#}");
-                    let ex = ApplicationException::new(
-                        ApplicationExceptionErrorCode::InternalError,
-                        "stream element exceeds the OSS transport frame limit".to_string(),
-                    );
-                    let frame = StreamFrame::ApplicationException(serialize_application_exception(
-                        &ex,
-                        protocol_id,
-                    ))
-                    .encode()
-                    .context("failed to encode oversized-frame error")?;
-                    (frame, true)
-                }
-            };
-            write_reply_frame(stream, &frame).await?;
-            if terminal {
-                return Ok(false);
-            }
-        }
-    }
-    write_reply_frame(stream, &StreamFrame::EndOfStream.encode()?).await?;
-    Ok(true)
-}
+// Type assertion: the request context works with generated services, whose
+// `RequestContext` must name its function names as `CStr`s.
+const _: fn() = || {
+    fn assert_request_context<R: fbthrift::RequestContext<Name = CStr>>() {}
+    assert_request_context::<RequestContext>();
+};
 
 #[cfg(test)]
-mod tests {
-    use fb303_core::fb303_status;
-    use fb303_core_services::BaseService;
-    use fb303_core_services::errors::GetNameExn;
-    use fb303_core_services::errors::GetStatusDetailsExn;
-    use fb303_core_services::errors::GetStatusExn;
-    use fb303_core_services::make_BaseService_server;
-    use fbthrift::Deserialize;
-    use fbthrift::Framing;
-    use fbthrift::Transport;
-    use mononoke_macros::mononoke;
-    use tokio::io::AsyncReadExt;
-    use tokio::io::AsyncWriteExt;
-
-    use super::*;
-    use crate::client::ClientTransport;
-
-    #[derive(Clone)]
-    struct NamedService(&'static str);
-
-    #[async_trait]
-    impl BaseService for NamedService {
-        async fn getName(&self) -> Result<String, GetNameExn> {
-            Ok(self.0.to_owned())
-        }
-
-        async fn getStatus(&self) -> Result<fb303_status, GetStatusExn> {
-            Ok(fb303_status::ALIVE)
-        }
-
-        async fn getStatusDetails(&self) -> Result<String, GetStatusDetailsExn> {
-            Ok(String::new())
-        }
-    }
-
-    /// Service that answers every request with a canned reply: unary when
-    /// `elements` is `None`, streaming otherwise.
-    #[derive(Clone)]
-    struct CannedService {
-        first: Bytes,
-        elements: Option<Vec<Bytes>>,
-        proto: ProtocolID,
-    }
-
-    #[async_trait]
-    impl ThriftService<Bytes> for CannedService {
-        type Handler = ();
-        type RequestContext = RequestContext;
-        type ReplyState = ReplyState;
-
-        async fn call(
-            &self,
-            _req: FramingDecoded<Bytes>,
-            _req_ctxt: &Self::RequestContext,
-            reply_state: Arc<Self::ReplyState>,
-        ) -> Result<()> {
-            let Some(elements) = self.elements.clone() else {
-                reply_state.send_reply(self.first.clone());
-                return Ok(());
-            };
-            let stream =
-                futures::stream::iter(elements.into_iter().map(SerializedStreamElement::Success))
-                    .boxed();
-            reply_state.send_stream_reply(self.first.clone(), Some(stream), self.proto)
-        }
-
-        fn create_interaction(
-            &self,
-            _name: &str,
-        ) -> Result<
-            Arc<
-                dyn ThriftService<
-                        Bytes,
-                        Handler = (),
-                        RequestContext = RequestContext,
-                        ReplyState = ReplyState,
-                    > + Send
-                    + 'static,
-            >,
-        > {
-            bail!("interactions not supported")
-        }
-
-        fn get_method_metadata(&self) -> &'static [MethodMetadata] {
-            &[]
-        }
-
-        async fn on_termination(&self) {}
-    }
-
-    struct TestServer {
-        address: String,
-        shutdown: oneshot::Sender<()>,
-        server: tokio::task::JoinHandle<()>,
-    }
-
-    impl TestServer {
-        async fn start(factory: Arc<ServiceFactory>) -> Self {
-            let listener =
-                TcpListener::from_std(bind("127.0.0.1", 0).expect("loopback should bind"))
-                    .expect("listener should convert");
-            let address = listener
-                .local_addr()
-                .expect("listener should have an address")
-                .to_string();
-            let (shutdown, shutdown_rx) = oneshot::channel();
-            let server = mononoke::spawn_task(serve(listener, factory, shutdown_rx));
-            Self {
-                address,
-                shutdown,
-                server,
-            }
-        }
-
-        async fn connect(&self) -> TcpStream {
-            TcpStream::connect(&self.address)
-                .await
-                .expect("client should connect")
-        }
-
-        async fn stop(self) {
-            let _ = self.shutdown.send(());
-            self.server.await.expect("server task should not panic");
-        }
-    }
-
-    fn named_service(name: &'static str) -> Arc<ServiceFactory> {
-        Arc::new(move |proto| {
-            Ok(box_service(make_BaseService_server(
-                proto,
-                NamedService(name),
-            )?))
-        })
-    }
-
-    fn canned_service(first: Bytes, elements: Option<Vec<Bytes>>) -> Arc<ServiceFactory> {
-        Arc::new(move |proto| {
-            Ok(box_service(CannedService {
-                first: first.clone(),
-                elements: elements.clone(),
-                proto,
-            }))
-        })
-    }
-
-    fn binary_call(method: &str, seq_id: i32) -> Vec<u8> {
-        let mut buf = Vec::new();
-        // Version and message type CALL.
-        buf.extend_from_slice(&[0x80, 0x01, 0x00, 0x01]);
-        buf.extend_from_slice(&(method.len() as u32).to_be_bytes());
-        buf.extend_from_slice(method.as_bytes());
-        buf.extend_from_slice(&seq_id.to_be_bytes());
-        // Empty argument struct.
-        buf.push(0x00);
-        buf
-    }
-
-    async fn send_frame(stream: &mut TcpStream, payload: &[u8]) {
-        write_frame(stream, payload)
-            .await
-            .expect("request should be written");
-    }
-
-    async fn receive_frame(stream: &mut TcpStream) -> Bytes {
-        read_frame(stream)
-            .await
-            .expect("reply should be readable")
-            .expect("reply should be present")
-    }
-
-    #[mononoke::test]
-    fn detects_protocols() {
-        assert_eq!(
-            detect_protocol(&[0x80, 0x01, 0x00, 0x01]).expect("binary should be detected"),
-            ProtocolID::BinaryProtocol
-        );
-        assert_eq!(
-            detect_protocol(&[0x82, 0x21, 0x00]).expect("compact should be detected"),
-            ProtocolID::CompactProtocol
-        );
-        assert!(detect_protocol(&[0x00, 0x00, 0x00]).is_err());
-        assert!(detect_protocol(&[0x80]).is_err());
-    }
-
-    #[mononoke::test]
-    fn bind_refuses_non_loopback_hosts() {
-        assert!(bind("0.0.0.0", 0).is_err());
-        assert!(bind("::", 0).is_err());
-    }
-
-    #[mononoke::test]
-    async fn serves_several_requests_on_one_connection() {
-        let server = TestServer::start(named_service("TestServer")).await;
-        let mut stream = server.connect().await;
-
-        for seq_id in 1..=3 {
-            send_frame(&mut stream, &binary_call("getName", seq_id)).await;
-            let reply = receive_frame(&mut stream).await;
-            assert_eq!(
-                reply[..4],
-                [0x80, 0x01, 0x00, 0x02],
-                "reply {seq_id} should be a binary REPLY message"
-            );
-            assert!(
-                String::from_utf8_lossy(&reply).contains("TestServer"),
-                "reply {seq_id} should carry the service name"
-            );
-        }
-
-        drop(stream);
-        server.stop().await;
-    }
-
-    #[mononoke::test]
-    async fn streams_elements_then_end_of_stream() {
-        let elements = vec![
-            Bytes::from_static(b"elem1"),
-            Bytes::from_static(b"elem2"),
-            Bytes::from_static(b"elem3"),
-        ];
-        let server = TestServer::start(canned_service(
-            Bytes::from_static(b"initial"),
-            Some(elements.clone()),
-        ))
-        .await;
-        let mut stream = server.connect().await;
-
-        send_frame(&mut stream, &binary_call("stream", 1)).await;
-        assert_eq!(
-            receive_frame(&mut stream).await,
-            Bytes::from_static(b"initial")
-        );
-        let mut received = Vec::new();
-        loop {
-            match StreamFrame::decode(receive_frame(&mut stream).await).expect("valid stream frame")
-            {
-                StreamFrame::Success(payload) => received.push(payload),
-                StreamFrame::EndOfStream => break,
-                other => panic!("unexpected stream frame: {other:?}"),
-            }
-        }
-        assert_eq!(received, elements);
-
-        drop(stream);
-        server.stop().await;
-    }
-
-    #[mononoke::test]
-    async fn an_empty_stream_is_just_end_of_stream() {
-        let server =
-            TestServer::start(canned_service(Bytes::from_static(b"only"), Some(vec![]))).await;
-        let mut stream = server.connect().await;
-
-        send_frame(&mut stream, &binary_call("stream", 1)).await;
-        assert_eq!(
-            receive_frame(&mut stream).await,
-            Bytes::from_static(b"only")
-        );
-        assert_eq!(
-            StreamFrame::decode(receive_frame(&mut stream).await).expect("valid stream frame"),
-            StreamFrame::EndOfStream
-        );
-
-        drop(stream);
-        server.stop().await;
-    }
-
-    #[mononoke::test]
-    async fn the_client_transport_reads_streams() {
-        let elements = vec![
-            Bytes::from_static(b"c_elem1"),
-            Bytes::from_static(b"c_elem2"),
-        ];
-        let server = TestServer::start(canned_service(
-            Bytes::from_static(b"first"),
-            Some(elements.clone()),
-        ))
-        .await;
-        let transport = ClientTransport::new(&server.address).expect("loopback should be accepted");
-
-        let request = Bytes::from(binary_call("stream", 1));
-        let mut encoded = ClientTransport::enc_with_capacity(request.len());
-        encoded.extend_from_slice(&request);
-        let (initial, stream) = transport
-            .call_stream(c"test", c"stream", encoded.freeze(), ())
-            .await
-            .expect("streaming call should succeed");
-        assert_eq!(initial.into_inner(), Bytes::from_static(b"first"));
-
-        let received: Vec<_> = stream
-            .map(
-                |element| match element.expect("stream element should succeed") {
-                    fbthrift::ClientStreamElement::Reply(cursor) => cursor.into_inner(),
-                    other => panic!("unexpected stream element: {other:?}"),
-                },
-            )
-            .collect()
-            .await;
-        assert_eq!(received, elements);
-
-        server.stop().await;
-    }
-
-    #[mononoke::test]
-    async fn an_oversized_stream_element_ends_the_stream_with_an_exception() {
-        let server = TestServer::start(canned_service(
-            Bytes::from_static(b"initial"),
-            Some(vec![Bytes::from(vec![0; MAX_FRAME_SIZE])]),
-        ))
-        .await;
-        let mut stream = server.connect().await;
-
-        send_frame(&mut stream, &binary_call("stream", 1)).await;
-        receive_frame(&mut stream).await;
-        assert!(matches!(
-            StreamFrame::decode(receive_frame(&mut stream).await).expect("valid stream frame"),
-            StreamFrame::ApplicationException(_)
-        ));
-        let mut trailing = [0_u8; 1];
-        let read = timeout(Duration::from_secs(1), stream.read(&mut trailing))
-            .await
-            .expect("server should close promptly")
-            .expect("socket read should succeed");
-        assert_eq!(
-            read, 0,
-            "server should close without an end-of-stream frame"
-        );
-
-        server.stop().await;
-    }
-
-    /// A unary response too large to frame comes back as an exception
-    /// addressed to the caller, rather than as a bare connection close.
-    #[mononoke::test]
-    async fn an_oversized_unary_response_is_an_exception() {
-        let server = TestServer::start(canned_service(
-            Bytes::from(vec![0; MAX_FRAME_SIZE + 1]),
-            None,
-        ))
-        .await;
-        let mut stream = server.connect().await;
-
-        send_frame(&mut stream, &binary_call("oversized", 7)).await;
-        let reply = receive_frame(&mut stream).await;
-        let mut deserializer = <BinaryProtocol>::deserializer(Cursor::new(reply));
-        let (method, message_type, seqid) = deserializer
-            .read_message_begin(|method| String::from_utf8_lossy(method).into_owned())
-            .expect("reply should carry a message envelope");
-        assert_eq!(method, "oversized");
-        assert_eq!(message_type, MessageType::Exception);
-        assert_eq!(seqid, 7);
-        let exception = ApplicationException::rs_thrift_read(&mut deserializer)
-            .expect("reply should carry an application exception");
-        assert_eq!(
-            exception.type_,
-            ApplicationExceptionErrorCode::InternalError
-        );
-        assert!(exception.message.contains("frame limit"));
-
-        server.stop().await;
-    }
-
-    #[mononoke::test]
-    async fn shutdown_closes_idle_connections() {
-        let server = TestServer::start(named_service("Idle")).await;
-        let mut stream = server.connect().await;
-        // Make sure the connection is being served before shutting down.
-        send_frame(&mut stream, &binary_call("getName", 1)).await;
-        receive_frame(&mut stream).await;
-
-        timeout(Duration::from_secs(5), server.stop())
-            .await
-            .expect("shutdown should not wait for idle connections");
-        let mut trailing = [0_u8; 1];
-        assert_eq!(
-            stream
-                .read(&mut trailing)
-                .await
-                .expect("socket read should succeed"),
-            0,
-            "the idle connection should have been closed"
-        );
-        stream
-            .shutdown()
-            .await
-            .expect("client side should shut down cleanly");
-    }
-}
+mod tests;
