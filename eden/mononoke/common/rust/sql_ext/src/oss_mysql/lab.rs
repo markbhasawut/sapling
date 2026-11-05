@@ -9,14 +9,17 @@
 //! load of real `mononoke_queries!` statements.
 //!
 //! The tests are ignored, and do nothing unless `MONONOKE_OSS_MYSQL_LAB`
-//! names the lab directory. It holds `lab.sh`, which runs three Percona
-//! servers with GTID replication: a (13306, server_id 1) the primary, b
-//! (13307, 2) and c (13305, 3) its replicas. After `lab.sh init`, every
-//! scenario starts from `lab.sh reset`, so run them one at a time:
+//! names the lab directory. It holds a copy of `lab.sh`, the script next to
+//! this file, which runs three Percona servers with GTID replication: a
+//! (13306, server_id 1) the primary, b (13307, 2) and c (13305, 3) its
+//! replicas. After `lab.sh init`, every scenario starts from `lab.sh reset`,
+//! so run them one at a time:
 //!
 //! ```text
+//! mkdir $L && cp lab.sh $L/ && $L/lab.sh init
 //! MONONOKE_OSS_MYSQL_LAB=$L cargo test --release -p sql_ext lab_ -- \
 //!     --ignored --test-threads=1 --nocapture
+//! $L/lab.sh teardown
 //! ```
 //!
 //! A scenario runs two or three registries, each standing for a Mononoke
