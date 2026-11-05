@@ -100,13 +100,29 @@ impl AuthorizationContext {
         AuthorizationContext::FullAccess
     }
 
-    /// Authorization context for requests to a server built for OSS. Such
-    /// servers only accept loopback connections and cannot authenticate
-    /// callers, so every request is allowed, as with
+    /// Authorization context for requests to a server built for OSS over
+    /// plaintext, which it accepts only on loopback and cannot authenticate,
+    /// so every request is allowed, as with
     /// [`Self::new_bypass_access_control`].
     #[cfg(not(fbcode_build))]
     pub fn new_oss_local() -> AuthorizationContext {
         AuthorizationContext::FullAccess
+    }
+
+    /// Authorization context for a request to a server built for OSS. A
+    /// caller over plaintext loopback carries only the `OSS_LOCAL` identity,
+    /// and is allowed everything, as with [`Self::new_oss_local`]. A caller
+    /// identified by its TLS certificate is checked as [`Self::new`] does.
+    #[cfg(not(fbcode_build))]
+    pub fn new_oss(ctx: &CoreContext) -> AuthorizationContext {
+        let identities = ctx.metadata().identities();
+        if identities.len() == 1
+            && identities.contains(&permission_checker::MononokeIdentity::oss_local())
+        {
+            Self::new_oss_local()
+        } else {
+            Self::new(ctx)
+        }
     }
 
     /// Returns true if this context is for a service write.
