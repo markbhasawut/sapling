@@ -92,7 +92,9 @@ impl MononokeIdentity {
                 Ok(format!(
                     "{}={}",
                     entry.object().nid().short_name()?,
-                    escape_subject_value(&entry.data().as_utf8()?)
+                    // `to_string` keeps any NUL in the value, which
+                    // `as_utf8` would cut the value short at.
+                    escape_subject_value(&entry.data().to_string()?)
                 ))
             })
             .collect();
@@ -257,6 +259,18 @@ mod tests {
         );
         let backslash = MononokeIdentity::try_from_x509(&cert(&[("CN", r"a\b")], &[])).unwrap();
         assert_eq!(typed(&backslash), vec![r"X509_SUBJECT_NAME:CN=a\\b"]);
+    }
+
+    /// A NUL in a subject value can't cut the value short, so a CN of
+    /// `admin\0evil` doesn't read as `admin`.
+    #[mononoke::test]
+    fn test_subject_values_keep_nul_bytes() {
+        let truncated =
+            MononokeIdentity::try_from_x509(&cert(&[("CN", "admin\0evil")], &[])).unwrap();
+        assert_eq!(
+            typed(&truncated),
+            vec!["X509_SUBJECT_NAME:CN=admin\0evil"]
+        );
     }
 
     #[mononoke::test]
