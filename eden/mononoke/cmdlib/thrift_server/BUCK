@@ -7,6 +7,7 @@ OSS_DEPS = [
     "fbsource//third-party/rust:bytes",
     "fbsource//third-party/rust:tracing",
     "//eden/mononoke/common/oss/thrift_transport:oss_thrift_transport",
+    "//eden/mononoke/cmdlib/mononoke_app/tls:tls",
 ]
 
 OSS_TEST_DEPS = [
@@ -15,6 +16,7 @@ OSS_TEST_DEPS = [
     "//fb303/thrift:fb303_core-rust",
     "//fb303/thrift:fb303_core-rust-clients",
     "//fb303/thrift:fb303_core-rust-services",
+    "fbsource//third-party/rust:openssl",
 ]
 
 rust_library(

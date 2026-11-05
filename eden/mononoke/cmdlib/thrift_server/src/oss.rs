@@ -5,8 +5,8 @@
  * GNU General Public License version 2.
  */
 
-//! OSS backend, which serves over the loopback-only `oss_thrift_transport`.
-//! See that crate for what the transport does not provide.
+//! OSS backend, which serves over `oss_thrift_transport`: mutual TLS on any
+//! address when given certificates, and otherwise plaintext on loopback.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -19,9 +19,13 @@ use fbinit::FacebookInit;
 use fbthrift::ApplicationException;
 use fbthrift::ProtocolID;
 use fbthrift::processor::ThriftService;
+pub use oss_thrift_transport::ServerTls;
+pub use oss_thrift_transport::server::Limits;
 use oss_thrift_transport::server::ReplyState;
+use oss_thrift_transport::server::ServerConfig;
 use oss_thrift_transport::server::ServiceFactory;
 use oss_thrift_transport::server::box_service;
+use tls::TLSArgs;
 use tokio::runtime::Handle;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -32,11 +36,12 @@ use tracing::warn;
 
 use crate::config::LoadMonitorConfig;
 
-/// The OSS transport is plaintext and unauthenticated, so servers listen on
-/// a loopback address unless told otherwise, and refuse any other address.
+/// Servers listen on a loopback address unless told otherwise. Without TLS
+/// certificates, they refuse any other address.
 pub const DEFAULT_THRIFT_HOST: &str = "127.0.0.1";
 
-/// Request context passed to services. It carries no caller identity.
+/// Request context passed to services: the identities in the caller's TLS
+/// certificate, if it connected over TLS.
 pub type RequestContext = oss_thrift_transport::server::RequestContext;
 
 /// How long [`ThriftServerShutdownHandle::stop`] waits for connections to
@@ -94,8 +99,9 @@ impl ThriftServerShutdownHandle {
 /// Builds an OSS Thrift server.
 ///
 /// This has the same methods as the fbcode builder, apart from those that
-/// configure fbcode-only infrastructure. Methods for features the OSS
-/// transport lacks are accepted and ignored.
+/// configure fbcode-only infrastructure, plus [`Self::with_tls_certificates`]
+/// and [`Self::with_limits`], which configure the OSS transport. Methods for
+/// features the OSS transport lacks are accepted and ignored.
 pub struct ThriftServerBuilder {
     service_name: Option<String>,
     host: String,
@@ -103,6 +109,7 @@ pub struct ThriftServerBuilder {
     factory: Option<Arc<ServiceFactory>>,
     handle: Option<Handle>,
     tls_requested: bool,
+    config: ServerConfig,
 }
 
 impl ThriftServerBuilder {
@@ -114,6 +121,7 @@ impl ThriftServerBuilder {
             factory: None,
             handle: None,
             tls_requested: false,
+            config: ServerConfig::default(),
         }
     }
 
@@ -122,7 +130,8 @@ impl ThriftServerBuilder {
         self
     }
 
-    /// The host to listen on. It must resolve only to loopback addresses.
+    /// The host to listen on. Without TLS certificates, it must resolve only
+    /// to loopback addresses.
     pub fn host(mut self, host: impl Into<String>) -> Self {
         self.host = host.into();
         self
@@ -133,16 +142,45 @@ impl ThriftServerBuilder {
         self
     }
 
-    /// Accepted, with a warning when the server starts: the OSS transport
-    /// is plaintext.
+    /// Serve TLS, with the certificates given to
+    /// [`Self::with_tls_certificates`]. Without them, the server serves
+    /// plaintext on loopback only, with a warning.
     pub fn with_tls(mut self) -> Self {
         self.tls_requested = true;
         self
     }
 
-    /// Accepted and ignored: requests run to completion even if the client
-    /// disconnects.
-    pub fn with_cancel_on_client_disconnect(self) -> Self {
+    /// Serve mutual TLS with this certificate, key and CA, as a server's
+    /// `--tls-*` arguments give them. Clients must present a certificate the
+    /// CA signed, and services see the identities in it.
+    pub fn with_tls_certificates(mut self, tls: ServerTls) -> Self {
+        self.config.tls = Some(tls);
+        self
+    }
+
+    /// Serve mutual TLS with the files a server's `--tls-ca`,
+    /// `--tls-certificate` and `--tls-private-key` name, if they are given.
+    pub fn with_tls_args(self, args: &TLSArgs) -> Result<Self> {
+        if args.tls_certificate.is_empty() {
+            return Ok(self);
+        }
+        if args.disable_mtls {
+            anyhow::bail!("thrift servers require mutual TLS; --disable-mtls is not supported");
+        }
+        let tls = ServerTls::from_files(&args.tls_ca, &args.tls_certificate, &args.tls_private_key)
+            .context("failed to load the thrift server's TLS certificates")?;
+        Ok(self.with_tls_certificates(tls))
+    }
+
+    /// The OSS transport's limits and timeouts.
+    pub fn with_limits(mut self, limits: Limits) -> Self {
+        self.config.limits = limits;
+        self
+    }
+
+    /// Stop a request's handler when its client resets the request.
+    pub fn with_cancel_on_client_disconnect(mut self) -> Self {
+        self.config.cancel_on_client_disconnect = true;
         self
     }
 
@@ -211,13 +249,14 @@ impl ThriftServerBuilder {
                 "build() must be called from a tokio runtime unless with_handle() is used",
             )?,
         };
-        if self.tls_requested {
+        if self.tls_requested && self.config.tls.is_none() {
             warn!(
-                "TLS was requested for {service_name}, but the OSS thrift transport is plaintext; it only listens on loopback addresses"
+                "TLS was requested for {service_name}, but no certificates were given; serving plaintext, on loopback addresses only"
             );
         }
 
-        let listener = oss_thrift_transport::server::bind(&self.host, self.port)?;
+        let listener =
+            oss_thrift_transport::server::bind_with(&self.host, self.port, &self.config)?;
         let listener = {
             let _runtime = runtime.enter();
             tokio::net::TcpListener::from_std(listener)
@@ -226,13 +265,21 @@ impl ThriftServerBuilder {
         let bound_address = listener
             .local_addr()
             .context("failed to get the bound address")?;
-        info!("{service_name} thrift server listening on {bound_address}");
+        info!(
+            "{service_name} thrift server listening on {bound_address}{}",
+            if self.config.tls.is_some() {
+                " with TLS"
+            } else {
+                ""
+            }
+        );
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let server = runtime.spawn(oss_thrift_transport::server::serve(
+        let server = runtime.spawn(oss_thrift_transport::server::serve_with(
             listener,
             factory,
             shutdown_rx,
+            self.config,
         ));
 
         Ok(MononokeThriftServer {
@@ -257,6 +304,20 @@ mod tests {
     use fb303_core_services::errors::GetStatusExn;
     use fb303_core_services::make_BaseService_server;
     use mononoke_macros::mononoke;
+    use openssl::asn1::Asn1Time;
+    use openssl::ec::EcGroup;
+    use openssl::ec::EcKey;
+    use openssl::hash::MessageDigest;
+    use openssl::nid::Nid;
+    use openssl::pkey::PKey;
+    use openssl::pkey::Private;
+    use openssl::x509::X509;
+    use openssl::x509::X509Builder;
+    use openssl::x509::X509NameBuilder;
+    use openssl::x509::extension::BasicConstraints;
+    use openssl::x509::extension::SubjectAlternativeName;
+    use oss_thrift_transport::ClientTls;
+    use oss_thrift_transport::client::ClientConfig;
 
     use super::*;
 
@@ -309,8 +370,104 @@ mod tests {
     }
 
     #[mononoke::fbinit_test]
-    async fn refuses_non_loopback_hosts(fb: FacebookInit) {
+    async fn refuses_non_loopback_hosts_without_tls(fb: FacebookInit) {
         assert!(build(fb, Handle::current(), "0.0.0.0").is_err());
         assert!(build(fb, Handle::current(), "::").is_err());
+    }
+
+    /// A self-signed CA and a certificate it signs, as PEM.
+    fn certificate(
+        ca: Option<&(X509, PKey<Private>)>,
+        subject: &str,
+        names: impl FnOnce(&mut SubjectAlternativeName),
+    ) -> (X509, PKey<Private>) {
+        let key = PKey::from_ec_key(
+            EcKey::generate(&EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap()).unwrap(),
+        )
+        .unwrap();
+        let mut name = X509NameBuilder::new().unwrap();
+        name.append_entry_by_text("CN", subject).unwrap();
+        name.append_entry_by_text("O", "mononoke-local").unwrap();
+        let name = name.build();
+        let mut builder = X509Builder::new().unwrap();
+        builder.set_version(2).unwrap();
+        builder.set_subject_name(&name).unwrap();
+        builder
+            .set_issuer_name(ca.map_or(&*name, |(ca, _)| ca.subject_name()))
+            .unwrap();
+        builder.set_pubkey(&key).unwrap();
+        builder
+            .set_not_before(&Asn1Time::days_from_now(0).unwrap())
+            .unwrap();
+        builder
+            .set_not_after(&Asn1Time::days_from_now(1).unwrap())
+            .unwrap();
+        if ca.is_none() {
+            builder
+                .append_extension(BasicConstraints::new().critical().ca().build().unwrap())
+                .unwrap();
+        } else {
+            let mut san = SubjectAlternativeName::new();
+            names(&mut san);
+            let san = san
+                .build(&builder.x509v3_context(ca.map(|(ca, _)| &**ca), None))
+                .unwrap();
+            builder.append_extension(san).unwrap();
+        }
+        builder
+            .sign(ca.map_or(&key, |(_, key)| key), MessageDigest::sha256())
+            .unwrap();
+        (builder.build(), key)
+    }
+
+    fn pem((certificate, key): &(X509, PKey<Private>)) -> (Vec<u8>, Vec<u8>) {
+        (
+            certificate.to_pem().unwrap(),
+            key.private_key_to_pem_pkcs8().unwrap(),
+        )
+    }
+
+    #[mononoke::fbinit_test]
+    async fn serves_tls_on_any_address(fb: FacebookInit) -> Result<()> {
+        let ca = certificate(None, "ca", |_| {});
+        let (ca_pem, _) = pem(&ca);
+        let (server_cert, server_key) = pem(&certificate(Some(&ca), "server", |san| {
+            san.ip("127.0.0.1");
+        }));
+        let (client_cert, client_key) = pem(&certificate(Some(&ca), "alice", |san| {
+            san.uri("user:alice");
+        }));
+
+        let runtime = Handle::current();
+        let mut server = ThriftServerBuilder::new(fb)
+            .service_name("test_service")
+            .host("0.0.0.0")
+            .with_tls()
+            .with_tls_certificates(ServerTls::from_pem(&ca_pem, &server_cert, &server_key)?)
+            .with_handle(runtime.clone())
+            .factory(runtime, move || {
+                move |proto| make_BaseService_server(proto, NamedService)
+            })
+            .build()?;
+        let address = format!("127.0.0.1:{}", server.bound_address()?.port());
+
+        let client = oss_thrift_transport::client::connect_with::<make_BaseService>(
+            &address,
+            ClientConfig {
+                tls: Some(ClientTls::from_pem(&ca_pem, &client_cert, &client_key)?),
+                ..ClientConfig::default()
+            },
+        )?;
+        assert_eq!(client.getName().await?, "test_service");
+
+        let plaintext = oss_thrift_transport::client::connect::<make_BaseService>(&address)?;
+        assert!(
+            plaintext.getName().await.is_err(),
+            "a TLS server should refuse plaintext"
+        );
+
+        let shutdown = server.into_shutdown_handle();
+        tokio::task::spawn_blocking(move || shutdown.stop()).await?;
+        Ok(())
     }
 }
