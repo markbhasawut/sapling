@@ -1,6 +1,9 @@
 # A deployable Thrift transport for OSS builds
 
-Status: proposal, for agreement before the bulk of the work.
+Status: implemented. The choices agreed before building it: HTTP/2 through
+`h2`, `openssl`, and changing the server builder and the services' ACLs
+along with the transport. Where the implementation differs from the
+proposal, the section says so.
 
 `oss_thrift_transport` is how OSS builds of Mononoke's Thrift services (SCS,
 the diff, land and bookmark services, and their clients) talk, through
@@ -154,6 +157,11 @@ light: openssl, serde and fbinit.
   use and replaced when it fails or receives `GOAWAY`. `SendRequest::ready()`
   waits for a stream slot, so callers queue rather than fail when the server's
   limit is reached.
+- Opening a connection waits for one PING round trip. `h2`'s client
+  handshake returns before the server has said anything, and a TLS 1.3
+  server rejects a client's certificate only after the client's handshake
+  has finished. Without the ping, a connection the server refused would
+  look open until a request was sent on it.
 
 **Retries** happen only when the server certainly did not run the request:
 
@@ -162,6 +170,12 @@ light: openssl, serde and fbinit.
 - the stream was above the last-stream-id of a `GOAWAY` from the server.
 
 The client then retries on a fresh connection, at most 3 times, with backoff.
+
+This relies on how `h2` 0.4.20 reports a GOAWAY. When one arrives, it
+fails only the streams above the frame's last-stream-id, with a remote
+GOAWAY error, whatever the frame's error code. Streams at or below it that
+never finish fail later with an I/O error. The tests pin this against a
+hand-written HTTP/2 server.
 
 Anything else after the request headers were sent fails the call and is not
 retried. That includes a reset with another code, a connection drop, a
@@ -241,14 +255,35 @@ New:
 
 **Builder (`cmdlib/thrift_server` OSS backend):**
 
-- `with_tls()` stops being a warning.
-- `with_tls_args(&TLSArgs)` (OSS only, like the fbcode-only options the other
-  way round) supplies the files. `with_tls()` without them fails `build()`
-  rather than serving plaintext.
+- `with_tls_certificates(ServerTls)` and `with_tls_args(&TLSArgs)` (OSS
+  only, like the fbcode-only options the other way round) supply the
+  certificates. `with_limits(Limits)` sets the limits, and
+  `with_cancel_on_client_disconnect()` is honored.
+- `with_tls()` without certificates still serves plaintext, with a warning,
+  and only on loopback. That differs from the proposal, which had it fail
+  `build()`: every service calls `with_tls()`, so failing would have broken
+  local development and the OSS integration tests, which run without
+  certificates.
 - A non-loopback `host()` needs TLS.
 
-The services and the `scsc`, diff, bookmark and pushrebase clients gain the
-existing `TLSArgs` flags in OSS builds.
+The OSS builds of the SCS, diff, land and bookmark servers take the
+`--tls-ca`, `--tls-certificate` and `--tls-private-key` flags that SLAPI
+already takes. `--disable-mtls` is refused.
+
+**Clients:**
+
+- `scsc` takes `--tls-ca`, `--tls-certificate` and `--tls-private-key`
+  (or `SCS_TLS_CA`, `SCS_TLS_CERTIFICATE` and `SCS_TLS_PRIVATE_KEY`).
+- SLAPI reaches the land service over mutual TLS in OSS builds when given
+  `--land-service-tls` with `--land-service-client-cert`,
+  `--land-service-client-private-key` and `--tls-ca`. The certificate flags
+  alone don't turn it on: the OSS integration tests pass them to every SLAPI
+  while their land service serves plaintext.
+- Any other binary can give every client it builds TLS with
+  `client::set_default_config()`.
+
+The bookmark service checks no ACLs in either build mode, so it only records
+the caller's identities.
 
 **Build modes:** the BUCK target gains `fbsource//third-party/rust:` `h2`,
 `http`, `openssl`, `tokio-openssl` and (for tests) `quickcheck`, plus
@@ -266,8 +301,9 @@ crate is OSS-only, so its tests also run in fbcode mode, as today.
   - a declared length over the limit fails before anything is allocated;
   - truncation at any point fails at end of stream;
   - stream-frame decoding of arbitrary payloads never panics.
-- A `cargo fuzz` target for the same decoder, for those with a nightly
-  toolchain.
+- (Proposed, not built: a `cargo fuzz` target for the same decoder. The
+  quickcheck properties run in both build modes without a nightly
+  toolchain.)
 
 **TLS, negative:**
 
@@ -318,6 +354,13 @@ connections are refused.
 
 **Kept:** upstream's existing tests, adapted to the new wire format.
 
-**Integration:** the builder test, with TLS and a non-loopback address. If
-the user agrees, also an SCS read and a denied read through TLS with the ACL
-file that SLAPI's tests use.
+**Integration:** the builder test, with TLS on `0.0.0.0`.
+
+**Services:** each service's OSS tests check that a TLS caller's identities
+reach its metadata, and that it is checked as `AuthorizationContext::new`
+does, while a loopback caller keeps `OSS_LOCAL` and full access.
+
+**End to end:** `scs/test-scs-tls.t` serves SCS over mutual TLS with the
+integration tests' certificates and ACLs. `client0` reads the repo, `proxy` is
+denied with its certificate's identity, and plaintext and a name mismatch are
+refused.
