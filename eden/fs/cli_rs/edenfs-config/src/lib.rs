@@ -71,7 +71,8 @@ pub struct EdenFsConfig {
     #[stack(nested)]
     pub redirections: Redirections,
 
-    #[stack(merge = "merge_table")]
+    // Only reading a configuration file sets it, and an install may have none.
+    #[stack(merge = "merge_table", default)]
     #[serde(flatten)]
     /// A catch-all field for unused configuration fields. If you need
     /// to use any configurations, define them above instead of reading from
@@ -226,6 +227,19 @@ pub fn load_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_no_configuration_files() {
+        // An install without /etc/eden/edenfs.rc, as open-source ones are,
+        // and a user without ~/.edenrc.
+        let empty = std::env::temp_dir().join(format!("edenfs-config-test-{}", std::process::id()));
+        std::fs::create_dir_all(&empty).unwrap();
+        let config = load_config(&empty, Some(&empty)).unwrap();
+        std::fs::remove_dir(&empty).unwrap();
+
+        assert!(config.other.is_empty());
+        assert_eq!(config.prefetch_profiles.prefetching_enabled, None);
+    }
 
     #[test]
     fn test_unknown_telemetry_settings_are_preserved_and_merged() {
